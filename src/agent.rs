@@ -19,7 +19,8 @@ pub struct Agent {
 }
 
 /// The diff under review can carry instructions, so the agent only gets
-/// read-only file tools: no shell, no MCP servers, no user settings.
+/// read-only file tools: no shell, no MCP servers, and no settings files
+/// (so no hooks) from the user or from the repository under review.
 const TOOLS: &str = "Read,Grep,Glob";
 
 pub struct Options<'a> {

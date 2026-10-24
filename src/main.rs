@@ -73,12 +73,20 @@ fn main() -> Result<()> {
     let range = repo.resolve(spec.as_deref())?;
     std::thread::spawn(highlight::warm);
     let mut ws = manifest::build(&repo, &range)?;
+    let mut _tmp: Option<tempfile::TempDir> = None;
     if matches!(cmd.as_str(), "review" | "plan") && !no_agent && snapshot.is_none() {
         let dir = match range.head.as_deref().and_then(|h| plan::cache_dir(&repo.root, &range.base, h)) {
-            Some(d) => d.join("files"),
-            None => std::env::temp_dir().join(format!("cicerone-{}", std::process::id())),
+            Some(d) => Some(d.join("files")),
+            None => tempfile::Builder::new()
+                .prefix("cicerone-")
+                .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .tempdir()
+                .ok()
+                .map(|t| _tmp.insert(t).path().to_path_buf()),
         };
-        if plan::snapshot(&ws, &dir).is_ok() {
+        if let Some(dir) = dir
+            && plan::snapshot(&ws, &dir).is_ok()
+        {
             ws.snapshot = Some(dir);
         }
     }
@@ -134,11 +142,6 @@ fn main() -> Result<()> {
             let mut terminal = ratatui::init();
             let res = app.run(&mut terminal);
             ratatui::restore();
-            if cache.is_none()
-                && let Some(d) = &ws.snapshot
-            {
-                let _ = std::fs::remove_dir_all(d);
-            }
             res?;
         }
     }
