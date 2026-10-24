@@ -115,6 +115,7 @@ struct Header {
 enum Item {
     Tour(Header),
     Stage(Stage),
+    Finding(crate::review::Finding),
 }
 
 #[derive(Default)]
@@ -125,6 +126,7 @@ pub struct Parser {
 pub enum Parsed {
     Header { title: String, intent: String, glossary: Vec<Gloss> },
     Stage(Stage),
+    Finding(crate::review::Finding),
 }
 
 impl Parser {
@@ -156,6 +158,7 @@ fn parse_line(line: &str) -> Option<Parsed> {
             glossary: h.glossary,
         }),
         Item::Stage(s) => Some(Parsed::Stage(s)),
+        Item::Finding(f) => Some(Parsed::Finding(f)),
     }
 }
 
@@ -191,7 +194,9 @@ pub fn coverage_prompt(ws: &Workspace, missing: &[&crate::manifest::HunkEntry]) 
 /// Rebuilds the stages that cicerone owns, so a cached tour follows the
 /// current mechanical analysis.
 pub fn refresh(tour: &mut Tour, ws: &Workspace) {
-    tour.stages.retain(|s| s.title != "Mechanical" && s.title != LEFT_OUT && s.title != "Not covered yet");
+    tour.stages.retain(|s| {
+        s.title != "Mechanical" && s.title != LEFT_OUT && s.title != "Not covered yet" && s.title != crate::review::TITLE
+    });
     complete(tour, ws);
 }
 
@@ -295,6 +300,7 @@ pub fn run_headless(
     cache: Option<&std::path::Path>,
 ) -> anyhow::Result<Tour> {
     use crate::agent::Event;
+    use crate::review;
     let mut parser = Parser::default();
     let mut tour = Tour {
         title: String::new(),
@@ -303,7 +309,8 @@ pub fn run_headless(
         glossary: Vec::new(),
         stages: Vec::new(),
     };
-    let apply = |items: Vec<Parsed>, tour: &mut Tour| {
+    let mut findings: Vec<review::Finding> = Vec::new();
+    let apply = |items: Vec<Parsed>, tour: &mut Tour, findings: &mut Vec<review::Finding>| {
         for it in items {
             match it {
                 Parsed::Header { title, intent, glossary } => {
@@ -315,31 +322,52 @@ pub fn run_headless(
                     eprintln!("stage: {}", crate::clean(&s.title));
                     tour.stages.push(s);
                 }
+                Parsed::Finding(f) => {
+                    if let Some(f) = review::accept(f, ws, findings.len() + 1) {
+                        eprintln!("finding: {} {}", f.severity.label(), crate::clean(&f.title));
+                        findings.push(f);
+                    }
+                }
             }
         }
     };
-    let mut covering = false;
+    #[derive(PartialEq)]
+    enum Phase {
+        Plan,
+        Cover,
+        Review,
+    }
+    let mut phase = Phase::Plan;
     for e in rx {
         match e {
-            Event::Text(t) => apply(parser.push(&t), &mut tour),
+            Event::Text(t) => apply(parser.push(&t), &mut tour, &mut findings),
             Event::Tool(t) => eprintln!("tool: {}", crate::clean(&t)),
             Event::TurnDone { ok } => {
-                apply(parser.finish(), &mut tour);
+                apply(parser.finish(), &mut tour, &mut findings);
+                parser = Parser::default();
                 anyhow::ensure!(ok, "the agent reported an error");
                 anyhow::ensure!(!tour.stages.is_empty(), "the agent returned no stages");
-                let missing = uncovered(&tour, ws);
-                if covering || missing.is_empty() {
+                if phase == Phase::Review {
                     break;
                 }
-                eprintln!("coverage: {} hunks", missing.len());
-                agent.send(&coverage_prompt(ws, &missing))?;
-                covering = true;
+                let missing = uncovered(&tour, ws);
+                if phase == Phase::Plan && !missing.is_empty() {
+                    eprintln!("coverage: {} hunks", missing.len());
+                    agent.send(&coverage_prompt(ws, &missing))?;
+                    phase = Phase::Cover;
+                    continue;
+                }
+                complete(&mut tour, ws);
+                save(&tour, cache);
+                eprintln!("reviewing");
+                agent.send(review::PROMPT)?;
+                phase = Phase::Review;
             }
             Event::Exited(err) => anyhow::bail!("the agent stopped: {err}"),
         }
     }
-    complete(&mut tour, ws);
-    save(&tour, cache);
+    review::save(&findings, cache);
+    review::sync_stage(&mut tour, &findings);
     Ok(tour)
 }
 
@@ -366,5 +394,8 @@ mod tests {
         let Parsed::Stage(s) = &got[1] else { panic!() };
         assert_eq!(s.steps[0].blocks.len(), 2);
         assert!(matches!(&s.steps[0].blocks[1], Block::Lens(l) if l.symbol.as_deref() == Some("S1")));
+        let mut p = Parser::default();
+        let got = p.push("{\"finding\":{\"severity\":\"risk\",\"title\":\"T\",\"file\":\"A.hs\",\"lines\":[3,5]}}\n");
+        assert!(matches!(&got[0], Parsed::Finding(f) if f.lines == (3, 5) && f.severity == crate::review::Severity::Risk));
     }
 }

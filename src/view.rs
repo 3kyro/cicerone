@@ -1,6 +1,7 @@
 use crate::lens::{LensView, RowKind, kind_label};
 use crate::manifest::{Change, Symbol, Workspace};
 use crate::mechanical::Mechanical;
+use crate::review::{Finding, Severity};
 use crate::syntax::{self, DeclKind};
 use crate::theme::{self, *};
 use crate::tour::{Tour, short};
@@ -198,7 +199,48 @@ pub fn group_widest(ws: &Workspace, g: &crate::tour::Group) -> usize {
         .unwrap_or(0)
 }
 
-pub fn lens(v: &LensView, focused: bool, w: usize, hs: usize) -> Lines {
+pub fn severity_style(s: Severity) -> Style {
+    Style::default().fg(match s {
+        Severity::Bug => RED,
+        Severity::Risk => PEACH,
+        Severity::Question => YELLOW,
+        Severity::Nit => SUBTEXT,
+    })
+}
+
+/// A finding as a card: its severity and title, then its body, each line
+/// after `prefix`.
+pub fn finding_card(f: &Finding, prefix: Vec<Span<'static>>, w: usize) -> Lines {
+    let pw = width(&prefix);
+    let st = severity_style(f.severity);
+    let mut out = vec![Line::from(truncate(
+        [
+            prefix.clone(),
+            vec![
+                Span::styled("◆ ", st),
+                Span::styled(format!("{} ", f.severity.label()), st.add_modifier(Modifier::BOLD)),
+                Span::styled(f.title.clone(), text().add_modifier(Modifier::BOLD)),
+            ],
+        ]
+        .concat(),
+        w,
+    ))];
+    for l in markdown(&f.body, w.saturating_sub(pw + 2)) {
+        let mut spans = prefix.clone();
+        spans.push(Span::styled("│ ", st));
+        spans.extend(l.spans);
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+pub fn fit(spans: Vec<Span<'static>>, w: usize) -> Vec<Span<'static>> {
+    truncate(spans, w)
+}
+
+/// `findings` get a mark on their lines; the ones named in `cards` also get
+/// their card, under the first line they cover.
+pub fn lens(v: &LensView, focused: bool, w: usize, hs: usize, findings: &[&Finding], cards: &[&str]) -> Lines {
     let frame = Style::default().fg(if focused { MAUVE } else { SURFACE });
     let mut out = Vec::new();
     let mut chips: Vec<Span<'static>> = Vec::new();
@@ -232,6 +274,7 @@ pub fn lens(v: &LensView, focused: bool, w: usize, hs: usize) -> Lines {
     out.push(Line::from(truncate(head, w)));
 
     let code_w = w.saturating_sub(LENS_GUTTER);
+    let mut carded: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for row in &v.rows {
         let num = row.new.or(row.old).map(|n| format!("{n:>5}")).unwrap_or_else(|| "     ".into());
         let (mark, mark_style, bg) = match (&row.kind, v.diff) {
@@ -242,10 +285,18 @@ pub fn lens(v: &LensView, focused: bool, w: usize, hs: usize) -> Lines {
         };
         let bg = if row.focus { Some(FOCUS_BG) } else { bg };
         let base = bg.map_or(Style::default(), |b| Style::default().bg(b));
+        let hit: Vec<&&Finding> = match (row.new, row.last, &row.kind) {
+            (Some(a), Some(b), k) if *k != RowKind::Del => findings.iter().filter(|f| f.hits(&v.file, a, b)).collect(),
+            _ => Vec::new(),
+        };
+        let gutter = match hit.iter().map(|f| f.severity).min() {
+            Some(sev) => Span::styled("◆", severity_style(sev)),
+            None => Span::styled(if hs > 0 { "«" } else { " " }, Style::default().fg(PEACH)),
+        };
         let mut line = vec![
             Span::styled("│", frame),
             Span::styled(num, if row.focus { Style::default().fg(MAUVE) } else { dim() }),
-            Span::styled(if hs > 0 { "«" } else { " " }, Style::default().fg(PEACH)),
+            gutter,
             Span::styled(format!("{mark} "), mark_style.patch(base)),
         ];
         match &row.kind {
@@ -271,6 +322,11 @@ pub fn lens(v: &LensView, focused: bool, w: usize, hs: usize) -> Lines {
             }
         }
         out.push(Line::from(line));
+        for f in hit {
+            if cards.contains(&f.id.as_str()) && carded.insert(f.id.as_str()) {
+                out.extend(finding_card(f, vec![Span::styled("│", frame), Span::raw("       ")], w));
+            }
+        }
         if let Some(n) = &row.note {
             out.push(Line::from(truncate(
                 vec![
@@ -506,7 +562,14 @@ pub fn mechanical(ws: &Workspace, w: usize) -> Lines {
 
 const GROUP_LINES: usize = 6;
 
-pub fn group(ws: &Workspace, g: &crate::tour::Group, w: usize, hs: usize) -> Lines {
+pub fn group(
+    ws: &Workspace,
+    g: &crate::tour::Group,
+    w: usize,
+    hs: usize,
+    findings: &[&Finding],
+    cards: &[&str],
+) -> Lines {
     let mut out = Vec::new();
     if !g.title.is_empty() {
         out.push(Line::from(vec![
@@ -528,8 +591,15 @@ pub fn group(ws: &Workspace, g: &crate::tour::Group, w: usize, hs: usize) -> Lin
             .filter_map(|s| ws.symbol(s))
             .map(|s| s.name.as_str())
             .collect();
+        let end = h.new.0 + h.new.1.saturating_sub(1);
+        let hit: Vec<&&Finding> = findings.iter().filter(|f| f.hits(&h.file, h.new.0, end)).collect();
+        let mark = match hit.iter().map(|f| f.severity).min() {
+            Some(sev) => Span::styled("◆ ", severity_style(sev)),
+            None => Span::raw(""),
+        };
         out.push(Line::from(truncate(
             vec![
+                mark,
                 Span::styled(format!("{:<5}", h.id), Style::default().fg(SURFACE)),
                 Span::styled(format!("{}:{}", short(&h.file), h.new.0), Style::default().fg(SUBTEXT)),
                 Span::styled(
@@ -539,6 +609,9 @@ pub fn group(ws: &Workspace, g: &crate::tour::Group, w: usize, hs: usize) -> Lin
             ],
             w,
         )));
+        for f in hit.iter().filter(|f| cards.contains(&f.id.as_str())) {
+            out.extend(finding_card(f, vec![Span::raw("     ")], w));
+        }
         let lines: Vec<&String> = ws
             .file(&h.file)
             .and_then(|f| f.diff.hunks.iter().find(|x| x.id == h.id))

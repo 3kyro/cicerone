@@ -79,6 +79,15 @@ impl LensSpec {
         }
     }
 
+    pub fn lines(file: &str, a: usize, b: usize) -> LensSpec {
+        LensSpec {
+            symbol: None,
+            file: Some(file.into()),
+            lines: Some((a, b)),
+            ..LensSpec::symbol("", Resolution::Full)
+        }
+    }
+
     pub fn hunk(id: &str) -> LensSpec {
         LensSpec {
             symbol: None,
@@ -125,9 +134,13 @@ pub struct Row {
     pub spans: Vec<(usize, usize, Hl)>,
     pub focus: bool,
     pub note: Option<String>,
+    /// The last head line the row stands for: the row's own line, or the
+    /// end of the lines a hole folds.
+    pub last: Option<usize>,
 }
 
 pub struct LensView {
+    pub file: String,
     pub title: String,
     pub place: String,
     pub resolution: Resolution,
@@ -190,10 +203,15 @@ impl Lenses {
                 let idx = f.and_then(|f| f.diff.hunks.iter().position(|x| x.id == h.id));
                 (f, h.id.clone(), Box::new(move |r: &URow, _| r.hunk.is_some() && r.hunk == idx))
             } else if let (Some(path), Some((a, b))) = (spec.file.as_deref(), spec.lines) {
+                let f = ws.file(path);
+                let rows = f.map(|f| self.file(f).rows.clone()).unwrap_or_default();
+                let inside = |r: &URow| r.new.is_some_and(|n| a <= n && n <= b);
+                let first = rows.iter().position(inside).unwrap_or(usize::MAX);
+                let last = rows.iter().rposition(inside).unwrap_or(0);
                 (
-                    ws.file(path),
-                    format!("{a}-{b}"),
-                    Box::new(move |r: &URow, _| r.new.is_some_and(|n| a <= n && n <= b)),
+                    f,
+                    crate::tour::short(path),
+                    Box::new(move |_: &URow, i| first <= i && i <= last),
                 )
             } else {
                 (None, String::new(), Box::new(|_: &URow, _| false))
@@ -206,6 +224,7 @@ impl Lenses {
         let picked: Vec<&URow> = fv.rows.iter().enumerate().filter(|(i, r)| pick(r, *i)).map(|(_, r)| r).collect();
         let rows = fold(fv, &picked, |_| true, diff, spec);
         LensView {
+            file: file.diff.path.clone(),
             title,
             place: place(&file.diff.path, &picked),
             resolution: Resolution::Full,
@@ -282,8 +301,10 @@ impl Lenses {
                 spans: Vec::new(),
                 focus: false,
                 note: None,
+                last: Some(s),
             };
             return LensView {
+                file: sym.file.clone(),
                 title,
                 place,
                 resolution: res,
@@ -335,6 +356,7 @@ impl Lenses {
         };
         let rows = fold(fv, &picked, keep, diff, spec);
         LensView {
+            file: sym.file.clone(),
             title,
             place,
             resolution: res,
@@ -347,6 +369,7 @@ impl Lenses {
 
 fn empty(spec: &LensSpec, available: Vec<Resolution>) -> LensView {
     LensView {
+        file: spec.file.clone().unwrap_or_default(),
         title: spec
             .symbol
             .clone()
@@ -406,6 +429,7 @@ fn fold(
             spans,
             focus,
             note,
+            last: r.new,
         }
     };
     let mut out: Vec<Row> = Vec::new();
@@ -449,6 +473,7 @@ fn fold(
             spans: Vec::new(),
             focus: false,
             note: None,
+            last: range.map(|(_, b)| *b),
         });
         hidden.clear();
     };

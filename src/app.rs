@@ -2,6 +2,7 @@ use crate::agent::{self, Agent};
 use crate::chat::{Chat, Msg, Role};
 use crate::lens::{Lenses, Resolution};
 use crate::plan;
+use crate::review;
 use crate::manifest::Workspace;
 use crate::theme::*;
 use crate::tour::{Block, Tour};
@@ -22,9 +23,16 @@ const AUTO: usize = 0;
 const HSTEP: usize = 8;
 const AGENT: usize = 1;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Plan,
+    Cover,
+    Review,
+}
+
 struct Planning {
     parser: plan::Parser,
-    covering: bool,
+    phase: Phase,
     status: String,
     error: Option<String>,
     started: Instant,
@@ -38,6 +46,8 @@ pub struct AgentConfig {
 
 pub struct App<'a> {
     ws: &'a Workspace,
+    findings: Vec<review::Finding>,
+    step_findings: Vec<Vec<usize>>,
     chat: Chat,
     config: Option<AgentConfig>,
     needs_primer: bool,
@@ -82,6 +92,8 @@ impl<'a> App<'a> {
         });
         let mut app = App {
             ws,
+            findings: Vec::new(),
+            step_findings: Vec::new(),
             chat: Chat::default(),
             config: None,
             needs_primer: false,
@@ -128,7 +140,7 @@ impl<'a> App<'a> {
         self.events = Some(events);
         self.planning = Some(Planning {
             parser: plan::Parser::default(),
-            covering: false,
+            phase: Phase::Plan,
             status: "reading the change".into(),
             error: None,
             started: Instant::now(),
@@ -202,6 +214,14 @@ impl<'a> App<'a> {
         self.dispatch(message);
     }
 
+    fn with_primer(&mut self, message: String) -> String {
+        if !self.needs_primer {
+            return message;
+        }
+        self.needs_primer = false;
+        format!("{}\n\n{message}", plan::primer(self.ws, &self.tours[self.current]))
+    }
+
     fn dispatch(&mut self, message: String) {
         if self.agent.is_none()
             && let Err(e) = self.start_agent()
@@ -209,12 +229,7 @@ impl<'a> App<'a> {
             self.chat.push_text(&format!("_{e}_"));
             return;
         }
-        let full = if self.needs_primer {
-            self.needs_primer = false;
-            format!("{}\n\n{message}", plan::primer(self.ws, &self.tours[self.current]))
-        } else {
-            message.clone()
-        };
+        let full = self.with_primer(message.clone());
         self.last_question = Some(message);
         self.turn_text = false;
         if let Some(a) = &mut self.agent
@@ -274,6 +289,84 @@ impl<'a> App<'a> {
             .flat_map(|(s, st)| (0..st.steps.len()).map(move |i| (s, i)))
             .collect();
         self.pos = self.pos.min(self.steps.len().saturating_sub(1));
+        self.index_findings();
+    }
+
+    /// For each step, the findings whose lines its lenses and groups show.
+    fn index_findings(&mut self) {
+        let ws = self.ws;
+        let ranges = |b: &Block| -> Vec<(String, usize, usize)> {
+            let hunk = |id: &str| {
+                ws.hunk(id)
+                    .map(|h| (h.file.clone(), h.new.0, h.new.0 + h.new.1.saturating_sub(1)))
+            };
+            match b {
+                Block::Lens(l) => {
+                    if let Some(sym) = l.symbol.as_deref().and_then(|id| ws.symbol(id)) {
+                        let deep = l.resolution >= Resolution::Skeleton
+                            || (l.resolution == Resolution::Signature && sym.kind.is_type_level());
+                        if sym.change == crate::manifest::Change::Removed || !deep {
+                            return Vec::new();
+                        }
+                        return vec![(sym.file.clone(), sym.lines.0, sym.lines.1)];
+                    }
+                    if let Some(h) = l.hunk.as_deref().and_then(hunk) {
+                        return vec![h];
+                    }
+                    match (&l.file, l.lines) {
+                        (Some(f), Some((a, b))) => vec![(f.clone(), a, b)],
+                        _ => Vec::new(),
+                    }
+                }
+                Block::Group(g) => g.hunks.iter().filter_map(|h| hunk(h)).collect(),
+                _ => Vec::new(),
+            }
+        };
+        let tour = &self.tours[self.current];
+        let mut placed = vec![false; self.findings.len()];
+        self.step_findings = self
+            .steps
+            .iter()
+            .map(|&(si, i)| {
+                let step = &tour.stages[si].steps[i];
+                let rs: Vec<(String, usize, usize)> = step.blocks.iter().flat_map(ranges).collect();
+                let explicit: Vec<&str> = step
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Finding(id) => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let is_review = tour.stages[si].title == review::TITLE;
+                (0..self.findings.len())
+                    .filter(|&k| {
+                        let f = &self.findings[k];
+                        if explicit.contains(&f.id.as_str()) {
+                            return true;
+                        }
+                        if is_review || placed[k] || !rs.iter().any(|(file, a, b)| f.hits(file, *a, *b)) {
+                            return false;
+                        }
+                        placed[k] = true;
+                        true
+                    })
+                    .collect()
+            })
+            .collect();
+    }
+
+    fn jump_finding(&mut self, forward: bool) {
+        let n = self.steps.len();
+        let has = |p: usize| self.step_findings.get(p).is_some_and(|v| !v.is_empty());
+        let target = if forward {
+            (self.pos + 1..n).find(|&p| has(p))
+        } else {
+            (0..self.pos).rev().find(|&p| has(p))
+        };
+        if let Some(t) = target {
+            self.go(t);
+        }
     }
 
     fn switch_tour(&mut self, to: usize) {
@@ -310,36 +403,122 @@ impl<'a> App<'a> {
             }
             agent::Event::TurnDone { ok } => {
                 let rest = p.parser.finish();
-                let covering = p.covering;
+                let phase = p.phase;
                 if !ok {
                     p.error = Some("the agent reported an error".into());
                 }
                 self.apply(rest);
-                if ok && !covering && !self.tours[AGENT].stages.is_empty() {
-                    let missing = plan::uncovered(&self.tours[AGENT], self.ws);
-                    if !missing.is_empty() {
-                        let msg = plan::coverage_prompt(self.ws, &missing);
-                        if let (Some(a), Some(p)) = (&mut self.agent, &mut self.planning)
-                            && a.send(&msg).is_ok()
-                        {
-                            p.covering = true;
-                            p.status = format!("grouping {} more hunks", missing.len());
-                            return;
-                        }
-                    }
-                }
-                self.finish_planning();
+                self.next_phase(phase, ok);
                 return;
             }
             agent::Event::Exited(err) => {
+                let retry = p.phase == Phase::Review && self.resuming && self.findings.is_empty();
                 p.error = Some(if err.is_empty() { "the agent stopped".into() } else { err });
                 self.agent = None;
                 self.events = None;
-                self.finish_planning();
+                if retry {
+                    if let Some(c) = &mut self.config {
+                        c.session = None;
+                    }
+                    self.planning = None;
+                    self.start_review();
+                    return;
+                }
+                if self.planning.as_ref().is_some_and(|p| p.phase != Phase::Review) {
+                    self.finish_tour();
+                }
+                self.end_planning();
                 return;
             }
         };
         self.apply(parsed);
+    }
+
+    fn next_phase(&mut self, done: Phase, ok: bool) {
+        if done == Phase::Plan && ok && !self.tours[AGENT].stages.is_empty() {
+            let missing = plan::uncovered(&self.tours[AGENT], self.ws);
+            if !missing.is_empty() {
+                let msg = plan::coverage_prompt(self.ws, &missing);
+                let status = format!("grouping {} more hunks", missing.len());
+                if self.turn(&msg, Phase::Cover, status) {
+                    return;
+                }
+            }
+        }
+        if done != Phase::Review {
+            if !self.finish_tour() {
+                self.end_planning();
+                return;
+            }
+            if self.turn(review::PROMPT, Phase::Review, "reviewing".into()) {
+                return;
+            }
+        }
+        self.end_planning();
+    }
+
+    /// Sends one planning turn; false when the agent is gone.
+    fn turn(&mut self, msg: &str, phase: Phase, status: String) -> bool {
+        let Some(p) = &mut self.planning else { return false };
+        let Some(a) = &mut self.agent else { return false };
+        if a.send(msg).is_err() {
+            return false;
+        }
+        p.phase = phase;
+        p.status = status;
+        p.parser = plan::Parser::default();
+        true
+    }
+
+    fn end_planning(&mut self) {
+        let reviewed = self.planning.take().is_some_and(|p| p.phase == Phase::Review);
+        if reviewed {
+            review::save(&self.findings, self.cache.as_deref());
+        }
+        if let Some(q) = self.chat.pending.take() {
+            self.dispatch(q);
+        }
+    }
+
+    /// Starts a review turn for a tour that has none yet.
+    pub fn review_now(mut self) -> Self {
+        self.start_review();
+        self
+    }
+
+    fn start_review(&mut self) {
+        if self.config.is_none() || self.planning.is_some() {
+            return;
+        }
+        if self.agent.is_none() && self.start_agent().is_err() {
+            return;
+        }
+        let msg = self.with_primer(review::PROMPT.to_string());
+        self.planning = Some(Planning {
+            parser: plan::Parser::default(),
+            phase: Phase::Review,
+            status: "reviewing".into(),
+            error: None,
+            started: Instant::now(),
+        });
+        if !self.agent.as_mut().is_some_and(|a| a.send(&msg).is_ok()) {
+            self.planning = None;
+        }
+    }
+
+    pub fn with_findings(mut self, findings: Vec<review::Finding>) -> Self {
+        self.findings = findings;
+        self.sync_findings();
+        self
+    }
+
+    fn sync_findings(&mut self) {
+        for t in &mut self.tours {
+            if !t.stages.is_empty() {
+                review::sync_stage(t, &self.findings);
+            }
+        }
+        self.refresh_steps();
     }
 
     fn apply(&mut self, parsed: Vec<plan::Parsed>) {
@@ -363,32 +542,31 @@ impl<'a> App<'a> {
                         self.refresh_steps();
                     }
                 }
+                plan::Parsed::Finding(f) => {
+                    if let Some(f) = review::accept(f, self.ws, self.findings.len() + 1) {
+                        self.findings.push(f);
+                        self.sync_findings();
+                    }
+                }
             }
         }
     }
 
-    fn finish_planning(&mut self) {
-        self.finish_plan_tour();
-        if let Some(q) = self.chat.pending.take() {
-            self.dispatch(q);
-        }
-    }
-
-    fn finish_plan_tour(&mut self) {
-        let Some(p) = self.planning.take() else { return };
+    /// Completes and caches the agent tour; false when the agent gave none.
+    fn finish_tour(&mut self) -> bool {
         if self.tours[AGENT].stages.is_empty() {
+            let err = self.planning.as_ref().and_then(|p| p.error.clone());
             self.notice = Some(format!(
                 "The agent did not return a tour{}. This is the automatic tour.",
-                p.error.map(|e| format!(" ({e})")).unwrap_or_default()
+                err.map(|e| format!(" ({e})")).unwrap_or_default()
             ));
-            return;
+            return false;
         }
         plan::complete(&mut self.tours[AGENT], self.ws);
         self.agent_ready = true;
-        if self.current == AGENT {
-            self.refresh_steps();
-        }
         plan::save(&self.tours[AGENT], self.cache.as_deref());
+        self.sync_findings();
+        true
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -587,6 +765,8 @@ impl<'a> App<'a> {
             KeyCode::Char('L') => self.hscroll_by((self.view_width / 2) as isize),
             KeyCode::Char('H') => self.hscroll_by(-((self.view_width / 2) as isize)),
             KeyCode::Char('0') => self.hscroll = 0,
+            KeyCode::Char(']') => self.jump_finding(true),
+            KeyCode::Char('[') => self.jump_finding(false),
             KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
             KeyCode::PageDown => self.scroll_by(half * 2),
@@ -675,7 +855,12 @@ impl<'a> App<'a> {
             } else {
                 ("○", dim())
             };
-            let max = (area.width as usize).saturating_sub(5);
+            let count: usize = positions
+                .iter()
+                .map(|&p| self.step_findings.get(p).map_or(0, Vec::len))
+                .sum();
+            let badge = if count > 0 { format!(" ◆{count}") } else { String::new() };
+            let max = (area.width as usize).saturating_sub(5 + badge.chars().count());
             let title = if st.title.chars().count() > max {
                 format!("{}…", st.title.chars().take(max.saturating_sub(1)).collect::<String>())
             } else {
@@ -684,6 +869,7 @@ impl<'a> App<'a> {
             lines.push(Line::from(vec![
                 Span::styled(format!(" {mark} "), style),
                 Span::styled(title, if si == cur.0 { style } else { text() }),
+                Span::styled(badge, Style::default().fg(PEACH)),
             ]));
             if si == cur.0 {
                 for (i, step) in st.steps.iter().enumerate() {
@@ -769,6 +955,31 @@ impl<'a> App<'a> {
             out.extend(view::markdown(&step.text, w));
             out.push(Line::default());
         }
+        let here: Vec<review::Finding> = self
+            .step_findings
+            .get(self.pos)
+            .map(|v| v.iter().map(|&k| self.findings[k].clone()).collect())
+            .unwrap_or_default();
+        let in_review = stage.title == review::TITLE;
+        if !here.is_empty() && !in_review {
+            out.push(Line::from(Span::styled(
+                format!("◆ {} review finding{} in this step", here.len(), if here.len() == 1 { "" } else { "s" }),
+                Style::default().fg(PEACH).add_modifier(Modifier::BOLD),
+            )));
+            for f in &here {
+                out.push(Line::from(view::fit(
+                    vec![
+                        Span::styled(format!("  {} ", f.severity.label()), view::severity_style(f.severity)),
+                        Span::styled(f.title.clone(), text()),
+                    ],
+                    w,
+                )));
+            }
+            out.push(Line::default());
+        }
+        let cards: Vec<&str> = if in_review { Vec::new() } else { here.iter().map(|f| f.id.as_str()).collect() };
+        let all: Vec<review::Finding> = self.findings.clone();
+        let marks: Vec<&review::Finding> = all.iter().collect();
         let mut starts = Vec::new();
         let mut li = 0;
         let mut hmax = 0;
@@ -781,10 +992,15 @@ impl<'a> App<'a> {
                 Block::Glossary => out.extend(view::glossary(self.ws, &self.tours[self.current], w)),
                 Block::Pattern(id) => out.extend(view::pattern(self.ws, id, w)),
                 Block::Mechanical => out.extend(view::mechanical(self.ws, w)),
+                Block::Finding(id) => {
+                    if let Some(f) = self.findings.iter().find(|f| &f.id == id) {
+                        out.extend(view::finding_card(f, Vec::new(), w));
+                    }
+                }
                 Block::Group(g) => {
                     let room = w.saturating_sub(view::GROUP_GUTTER);
                     hmax = hmax.max(view::group_widest(self.ws, g).saturating_sub(room));
-                    out.extend(view::group(self.ws, g, w, hs));
+                    out.extend(view::group(self.ws, g, w, hs, &marks, &cards));
                 }
                 Block::Lens(spec) => {
                     let (res, diff) = self
@@ -795,7 +1011,7 @@ impl<'a> App<'a> {
                     let v = self.lenses.view(self.ws, spec, res, diff);
                     starts.push(out.len());
                     hmax = hmax.max(view::widest(&v).saturating_sub(w.saturating_sub(view::LENS_GUTTER)));
-                    out.extend(view::lens(&v, li == self.focus, w, hs));
+                    out.extend(view::lens(&v, li == self.focus, w, hs, &marks, &cards));
                     li += 1;
                 }
             }
@@ -879,6 +1095,7 @@ impl<'a> App<'a> {
             ("N/P", "stage"),
             ("j/k", "scroll"),
             ("h/l", "sideways"),
+            ("]/[", "finding"),
             ("tab", "lens"),
             ("+/-", "zoom"),
             ("d", "diff"),
@@ -904,6 +1121,7 @@ fn draw_help(f: &mut Canvas, area: Rect) {
         ("N  P", "next / previous stage"),
         ("h  l  ←  →", "scroll code sideways"),
         ("H  L  0", "half a pane sideways / back to the start"),
+        ("]  [", "next / previous step with review findings"),
         ("j  k  ↓  ↑", "scroll"),
         ("ctrl-d  ctrl-u", "half page"),
         ("g  G", "top / bottom"),

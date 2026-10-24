@@ -8,6 +8,7 @@ mod lens;
 mod manifest;
 mod mechanical;
 mod plan;
+mod review;
 mod syntax;
 mod theme;
 mod tour;
@@ -105,7 +106,13 @@ fn main() -> Result<()> {
         }
         _ if snapshot.is_some() => {
             let keys = snapshot.unwrap_or_default();
-            print!("{}", app::App::new(&ws, tour::auto(&ws), tour).snapshot(&keys, 120, 40)?);
+            let cache = range
+                .head
+                .as_deref()
+                .and_then(|h| plan::cache_dir(&repo.root, &range.base, h));
+            let findings = review::load(cache.as_deref()).unwrap_or_default();
+            let app = app::App::new(&ws, tour::auto(&ws), tour).with_findings(findings);
+            print!("{}", app.snapshot(&keys, 120, 40)?);
         }
         _ => {
             let auto = tour::auto(&ws);
@@ -131,8 +138,15 @@ fn main() -> Result<()> {
                 model: model.clone(),
                 session: session.filter(|_| tour.is_none()),
             });
+            let findings = review::load(cache.as_deref());
             let app = if tour.is_some() || no_agent || cached.is_some() {
-                app::App::new(&ws, auto, tour.or(cached)).with_config(config, cache.clone())
+                let resumable = cached.is_some() && config.is_some();
+                let app = app::App::new(&ws, auto, tour.or(cached)).with_config(config, cache.clone());
+                match findings {
+                    Some(f) => app.with_findings(f),
+                    None if resumable => app.review_now(),
+                    None => app,
+                }
             } else {
                 let (a, rx, session) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
                 let config = config.map(|c| app::AgentConfig {

@@ -50,6 +50,7 @@ pub enum Block {
     Pattern(String),
     Mechanical,
     Group(Group),
+    Finding(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
