@@ -157,7 +157,48 @@ fn code_spans(text: &str, spans: &[(usize, usize, crate::highlight::Hl)], base: 
     out
 }
 
-pub fn lens(v: &LensView, focused: bool, w: usize) -> Lines {
+/// Drops the first `n` columns of `spans`, for horizontal scroll.
+fn skip(spans: Vec<Span<'static>>, mut n: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for s in spans {
+        if n == 0 {
+            out.push(s);
+            continue;
+        }
+        let mut kept = String::new();
+        for ch in s.content.chars() {
+            if n > 0 {
+                n = n.saturating_sub(unicode_width(ch));
+            } else {
+                kept.push(ch);
+            }
+        }
+        if !kept.is_empty() {
+            out.push(Span::styled(kept, s.style));
+        }
+    }
+    out
+}
+
+pub const LENS_GUTTER: usize = 9;
+pub const GROUP_GUTTER: usize = 7;
+
+pub fn widest(v: &LensView) -> usize {
+    v.rows.iter().map(|r| r.text.chars().count()).max().unwrap_or(0)
+}
+
+pub fn group_widest(ws: &Workspace, g: &crate::tour::Group) -> usize {
+    g.hunks
+        .iter()
+        .filter_map(|id| ws.hunk(id))
+        .filter_map(|h| ws.file(&h.file)?.diff.hunks.iter().find(|x| x.id == h.id))
+        .flat_map(|x| x.lines.iter().filter(|l| l.starts_with('+') || l.starts_with('-')).take(GROUP_LINES))
+        .map(|l| l.chars().count().saturating_sub(1))
+        .max()
+        .unwrap_or(0)
+}
+
+pub fn lens(v: &LensView, focused: bool, w: usize, hs: usize) -> Lines {
     let frame = Style::default().fg(if focused { MAUVE } else { SURFACE });
     let mut out = Vec::new();
     let mut chips: Vec<Span<'static>> = Vec::new();
@@ -190,7 +231,7 @@ pub fn lens(v: &LensView, focused: bool, w: usize) -> Lines {
     head.extend(chips);
     out.push(Line::from(truncate(head, w)));
 
-    let code_w = w.saturating_sub(9);
+    let code_w = w.saturating_sub(LENS_GUTTER);
     for row in &v.rows {
         let num = row.new.or(row.old).map(|n| format!("{n:>5}")).unwrap_or_else(|| "     ".into());
         let (mark, mark_style, bg) = match (&row.kind, v.diff) {
@@ -203,7 +244,8 @@ pub fn lens(v: &LensView, focused: bool, w: usize) -> Lines {
         let base = bg.map_or(Style::default(), |b| Style::default().bg(b));
         let mut line = vec![
             Span::styled("│", frame),
-            Span::styled(format!("{num} "), if row.focus { Style::default().fg(MAUVE) } else { dim() }),
+            Span::styled(num, if row.focus { Style::default().fg(MAUVE) } else { dim() }),
+            Span::styled(if hs > 0 { "«" } else { " " }, Style::default().fg(PEACH)),
             Span::styled(format!("{mark} "), mark_style.patch(base)),
         ];
         match &row.kind {
@@ -213,14 +255,14 @@ pub fn lens(v: &LensView, focused: bool, w: usize) -> Lines {
                 } else {
                     format!("⋯ {label}")
                 };
-                line.push(Span::raw(row.text.clone()));
+                line.push(Span::raw(row.text.get(hs..).unwrap_or("").to_string()));
                 line.push(Span::styled(text, dim().add_modifier(Modifier::ITALIC)));
                 if *changed {
                     line.push(Span::styled("  ● changes", Style::default().fg(PEACH)));
                 }
             }
             _ => {
-                let code = truncate(code_spans(&row.text, &row.spans, base), code_w);
+                let code = truncate(skip(code_spans(&row.text, &row.spans, base), hs), code_w);
                 let used = width(&code);
                 line.extend(code);
                 if bg.is_some() && used < code_w {
@@ -464,7 +506,7 @@ pub fn mechanical(ws: &Workspace, w: usize) -> Lines {
 
 const GROUP_LINES: usize = 6;
 
-pub fn group(ws: &Workspace, g: &crate::tour::Group, w: usize) -> Lines {
+pub fn group(ws: &Workspace, g: &crate::tour::Group, w: usize, hs: usize) -> Lines {
     let mut out = Vec::new();
     if !g.title.is_empty() {
         out.push(Line::from(vec![
@@ -509,14 +551,12 @@ pub fn group(ws: &Workspace, g: &crate::tour::Group, w: usize) -> Lines {
                 (Style::default().fg(RED), DEL_BG)
             };
             let text = l[1..].replace('\t', " ");
-            out.push(Line::from(truncate(
-                vec![
-                    Span::raw("     "),
-                    Span::styled(format!("{} ", &l[..1]), style.bg(bg)),
-                    Span::styled(text, Style::default().fg(TEXT).bg(bg)),
-                ],
-                w,
-            )));
+            let mut row = vec![
+                Span::styled(if hs > 0 { "    «" } else { "     " }, Style::default().fg(PEACH)),
+                Span::styled(format!("{} ", &l[..1]), style.bg(bg)),
+            ];
+            row.extend(skip(vec![Span::styled(text, Style::default().fg(TEXT).bg(bg))], hs));
+            out.push(Line::from(truncate(row, w)));
         }
         if lines.len() > GROUP_LINES {
             out.push(Line::from(Span::styled(

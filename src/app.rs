@@ -19,6 +19,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 const AUTO: usize = 0;
+const HSTEP: usize = 8;
 const AGENT: usize = 1;
 
 struct Planning {
@@ -62,6 +63,9 @@ pub struct App<'a> {
     lens_starts: Vec<usize>,
     content_len: usize,
     view_height: usize,
+    view_width: usize,
+    hscroll: usize,
+    hmax: usize,
     quit: bool,
 }
 
@@ -103,6 +107,9 @@ impl<'a> App<'a> {
             lens_starts: Vec::new(),
             content_len: 0,
             view_height: 0,
+            view_width: 0,
+            hscroll: 0,
+            hmax: 0,
             quit: false,
         };
         app.refresh_steps();
@@ -413,6 +420,7 @@ impl<'a> App<'a> {
                     "down" => KeyCode::Down,
                     "up" => KeyCode::Up,
                     "pgdn" => KeyCode::PageDown,
+                    "right" => KeyCode::Right,
                     "enter" => KeyCode::Enter,
                     "esc" => KeyCode::Esc,
                     _ => KeyCode::Null,
@@ -452,6 +460,7 @@ impl<'a> App<'a> {
             self.pos = pos;
             self.scroll = 0;
             self.focus = 0;
+            self.hscroll = 0;
             self.visited.insert(pos);
         }
     }
@@ -495,6 +504,10 @@ impl<'a> App<'a> {
                 _ => None,
             })
             .nth(self.focus)
+    }
+
+    fn hscroll_by(&mut self, d: isize) {
+        self.hscroll = (self.hscroll as isize + d).clamp(0, self.hmax as isize) as usize;
     }
 
     fn scroll_by(&mut self, d: isize) {
@@ -565,12 +578,15 @@ impl<'a> App<'a> {
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('d') if ctrl => self.scroll_by(half),
             KeyCode::Char('u') if ctrl => self.scroll_by(-half),
-            KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::Char('l') | KeyCode::Right => self.go(self.pos + 1),
-            KeyCode::Char('p') | KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
-                self.go(self.pos.saturating_sub(1))
-            }
-            KeyCode::Char('N') | KeyCode::Char('L') => self.go_stage(true),
-            KeyCode::Char('P') | KeyCode::Char('H') => self.go_stage(false),
+            KeyCode::Char('n') | KeyCode::Char(' ') => self.go(self.pos + 1),
+            KeyCode::Char('p') | KeyCode::Backspace => self.go(self.pos.saturating_sub(1)),
+            KeyCode::Char('N') => self.go_stage(true),
+            KeyCode::Char('P') => self.go_stage(false),
+            KeyCode::Char('l') | KeyCode::Right => self.hscroll_by(HSTEP as isize),
+            KeyCode::Char('h') | KeyCode::Left => self.hscroll_by(-(HSTEP as isize)),
+            KeyCode::Char('L') => self.hscroll_by((self.view_width / 2) as isize),
+            KeyCode::Char('H') => self.hscroll_by(-((self.view_width / 2) as isize)),
+            KeyCode::Char('0') => self.hscroll = 0,
             KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
             KeyCode::PageDown => self.scroll_by(half * 2),
@@ -755,6 +771,8 @@ impl<'a> App<'a> {
         }
         let mut starts = Vec::new();
         let mut li = 0;
+        let mut hmax = 0;
+        let hs = self.hscroll;
         let blocks = step.blocks.clone();
         for b in &blocks {
             match b {
@@ -763,7 +781,11 @@ impl<'a> App<'a> {
                 Block::Glossary => out.extend(view::glossary(self.ws, &self.tours[self.current], w)),
                 Block::Pattern(id) => out.extend(view::pattern(self.ws, id, w)),
                 Block::Mechanical => out.extend(view::mechanical(self.ws, w)),
-                Block::Group(g) => out.extend(view::group(self.ws, g, w)),
+                Block::Group(g) => {
+                    let room = w.saturating_sub(view::GROUP_GUTTER);
+                    hmax = hmax.max(view::group_widest(self.ws, g).saturating_sub(room));
+                    out.extend(view::group(self.ws, g, w, hs));
+                }
                 Block::Lens(spec) => {
                     let (res, diff) = self
                         .overrides
@@ -772,20 +794,24 @@ impl<'a> App<'a> {
                         .unwrap_or((spec.resolution, None));
                     let v = self.lenses.view(self.ws, spec, res, diff);
                     starts.push(out.len());
-                    out.extend(view::lens(&v, li == self.focus, w));
+                    hmax = hmax.max(view::widest(&v).saturating_sub(w.saturating_sub(view::LENS_GUTTER)));
+                    out.extend(view::lens(&v, li == self.focus, w, hs));
                     li += 1;
                 }
             }
             out.push(Line::default());
         }
         self.lens_starts = starts;
+        self.hmax = hmax;
         out
     }
 
     fn draw_main(&mut self, f: &mut Canvas, area: Rect) {
         let block = Frame::default().padding(Padding::new(2, 2, 1, 0));
         let inner = block.inner(area);
+        self.view_width = inner.width as usize;
         let lines = self.content(inner.width as usize);
+        self.hscroll = self.hscroll.min(self.hmax);
         self.content_len = lines.len();
         self.view_height = inner.height as usize;
         self.scroll = self.scroll.min(self.content_len.saturating_sub(1));
@@ -852,6 +878,7 @@ impl<'a> App<'a> {
             ("n/p", "step"),
             ("N/P", "stage"),
             ("j/k", "scroll"),
+            ("h/l", "sideways"),
             ("tab", "lens"),
             ("+/-", "zoom"),
             ("d", "diff"),
@@ -872,9 +899,11 @@ impl<'a> App<'a> {
 
 fn draw_help(f: &mut Canvas, area: Rect) {
     let rows = [
-        ("n  space  l  →", "next step"),
-        ("p  h  ←", "previous step"),
+        ("n  space", "next step"),
+        ("p", "previous step"),
         ("N  P", "next / previous stage"),
+        ("h  l  ←  →", "scroll code sideways"),
+        ("H  L  0", "half a pane sideways / back to the start"),
         ("j  k  ↓  ↑", "scroll"),
         ("ctrl-d  ctrl-u", "half page"),
         ("g  G", "top / bottom"),
