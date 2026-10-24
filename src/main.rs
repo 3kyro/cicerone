@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod chat;
 mod diff;
 mod git;
 mod highlight;
@@ -71,7 +72,16 @@ fn main() -> Result<()> {
     let spec = spec.or_else(|| tour.as_ref().and_then(|t| t.range.clone()));
     let range = repo.resolve(spec.as_deref())?;
     std::thread::spawn(highlight::warm);
-    let ws = manifest::build(&repo, &range)?;
+    let mut ws = manifest::build(&repo, &range)?;
+    if matches!(cmd.as_str(), "review" | "plan") && !no_agent && snapshot.is_none() {
+        let dir = match range.head.as_deref().and_then(|h| plan::cache_dir(&repo.root, &range.base, h)) {
+            Some(d) => d.join("files"),
+            None => std::env::temp_dir().join(format!("cicerone-{}", std::process::id())),
+        };
+        if plan::snapshot(&ws, &dir).is_ok() {
+            ws.snapshot = Some(dir);
+        }
+    }
     match cmd.as_str() {
         "manifest" if json => println!("{}", serde_json::to_string_pretty(&ws.manifest)?),
         "manifest" => print_text(&ws.manifest),
@@ -81,7 +91,7 @@ fn main() -> Result<()> {
                 .head
                 .as_deref()
                 .and_then(|h| plan::cache_dir(&repo.root, &range.base, h));
-            let (_agent, rx) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
+            let (_agent, rx, _) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
             let t = plan::run_headless(&ws, rx, cache.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&t)?);
         }
@@ -100,17 +110,35 @@ fn main() -> Result<()> {
                 .filter(|_| !replan)
                 .and_then(|d| std::fs::read_to_string(d.join("tour.json")).ok())
                 .and_then(|j| serde_json::from_str(&j).ok());
-            let app = if tour.is_some() || no_agent {
-                app::App::new(&ws, auto, tour)
-            } else if cached.is_some() {
-                app::App::new(&ws, auto, cached)
+            let session = cache
+                .as_ref()
+                .and_then(|d| std::fs::read_to_string(d.join("session")).ok())
+                .map(|s| s.trim().to_string());
+            let config = (!no_agent).then(|| app::AgentConfig {
+                root: repo.root.clone(),
+                model: model.clone(),
+                session: session.filter(|_| tour.is_none()),
+            });
+            let app = if tour.is_some() || no_agent || cached.is_some() {
+                app::App::new(&ws, auto, tour.or(cached)).with_config(config, cache.clone())
             } else {
-                let (a, rx) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
-                app::App::new(&ws, auto, None).with_agent(a, rx, true, cache.clone())
+                let (a, rx, session) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
+                let config = config.map(|c| app::AgentConfig {
+                    session: Some(session),
+                    ..c
+                });
+                app::App::new(&ws, auto, None)
+                    .with_config(config, cache.clone())
+                    .planning_with(a, rx)
             };
             let mut terminal = ratatui::init();
             let res = app.run(&mut terminal);
             ratatui::restore();
+            if cache.is_none()
+                && let Some(d) = &ws.snapshot
+            {
+                let _ = std::fs::remove_dir_all(d);
+            }
             res?;
         }
     }
@@ -122,7 +150,7 @@ fn start_planner(
     ws: &manifest::Workspace,
     cache: Option<&std::path::Path>,
     model: Option<&str>,
-) -> Result<(agent::Agent, std::sync::mpsc::Receiver<agent::Event>)> {
+) -> Result<(agent::Agent, std::sync::mpsc::Receiver<agent::Event>, String)> {
     let session = agent::new_session_id();
     if let Some(d) = cache {
         std::fs::create_dir_all(d)?;
@@ -138,14 +166,15 @@ fn start_planner(
             system: plan::SYSTEM,
             model,
             log: log.as_deref(),
+            files: ws.snapshot.as_deref(),
         },
         tx,
     )?;
     a.send(&plan::prompt(ws))?;
-    Ok((a, rx))
+    Ok((a, rx, session))
 }
 
-fn clean(s: &str) -> String {
+pub fn clean(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { char::REPLACEMENT_CHARACTER } else { c })
         .collect()

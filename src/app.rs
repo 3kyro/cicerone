@@ -1,4 +1,5 @@
 use crate::agent::{self, Agent};
+use crate::chat::{Chat, Msg, Role};
 use crate::lens::{Lenses, Resolution};
 use crate::plan;
 use crate::manifest::Workspace;
@@ -27,8 +28,20 @@ struct Planning {
     started: Instant,
 }
 
+pub struct AgentConfig {
+    pub root: PathBuf,
+    pub model: Option<String>,
+    pub session: Option<String>,
+}
+
 pub struct App<'a> {
     ws: &'a Workspace,
+    chat: Chat,
+    config: Option<AgentConfig>,
+    needs_primer: bool,
+    resuming: bool,
+    turn_text: bool,
+    last_question: Option<String>,
     tours: [Tour; 2],
     current: usize,
     agent: Option<Agent>,
@@ -64,6 +77,12 @@ impl<'a> App<'a> {
         });
         let mut app = App {
             ws,
+            chat: Chat::default(),
+            config: None,
+            needs_primer: false,
+            resuming: false,
+            turn_text: false,
+            last_question: None,
             tours: [auto, agent_tour],
             current,
             agent: None,
@@ -89,19 +108,149 @@ impl<'a> App<'a> {
         app
     }
 
-    pub fn with_agent(mut self, agent: Agent, events: Receiver<agent::Event>, planning: bool, cache: Option<PathBuf>) -> Self {
+    pub fn with_config(mut self, config: Option<AgentConfig>, cache: Option<PathBuf>) -> Self {
+        self.chat = Chat::load(cache.as_ref().map(|d| d.join("chat.json")).as_deref());
+        self.config = config;
+        self.cache = cache;
+        self
+    }
+
+    pub fn planning_with(mut self, agent: Agent, events: Receiver<agent::Event>) -> Self {
         self.agent = Some(agent);
         self.events = Some(events);
-        self.cache = cache;
-        if planning {
-            self.planning = Some(Planning {
-                parser: plan::Parser::default(),
-                status: "reading the change".into(),
-                error: None,
-                started: Instant::now(),
-            });
-        }
+        self.planning = Some(Planning {
+            parser: plan::Parser::default(),
+            status: "reading the change".into(),
+            error: None,
+            started: Instant::now(),
+        });
         self
+    }
+
+    fn chat_path(&self) -> Option<PathBuf> {
+        self.cache.as_ref().map(|d| d.join("chat.json"))
+    }
+
+    fn start_agent(&mut self) -> Result<()> {
+        let Some(cfg) = &self.config else {
+            anyhow::bail!("the agent is off (--no-agent)");
+        };
+        let (session, resume) = match &cfg.session {
+            Some(s) => (s.clone(), true),
+            None => (agent::new_session_id(), false),
+        };
+        if !resume && let Some(d) = &self.cache {
+            let _ = std::fs::create_dir_all(d);
+            let _ = std::fs::write(d.join("session"), &session);
+        }
+        let log = self.cache.as_ref().map(|d| d.join("agent-chat.log"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a = Agent::start(
+            agent::Options {
+                cwd: &cfg.root,
+                session: &session,
+                resume,
+                system: plan::SYSTEM,
+                model: cfg.model.as_deref(),
+                log: log.as_deref(),
+                files: self.ws.snapshot.as_deref(),
+            },
+            tx,
+        )?;
+        self.agent = Some(a);
+        self.events = Some(rx);
+        self.resuming = resume;
+        self.needs_primer = !resume;
+        Ok(())
+    }
+
+    fn ask(&mut self) {
+        let q = self.chat.input.trim().to_string();
+        if q.is_empty() || self.chat.busy {
+            return;
+        }
+        self.chat.input.clear();
+        self.chat.scroll = 0;
+        let about = self.chat.about.take();
+        self.chat.msgs.push(Msg {
+            role: Role::User,
+            text: q.clone(),
+            about: about.as_ref().map(|(label, _)| label.clone()),
+        });
+        let mut ctx = String::new();
+        if let Some(&(si, i)) = self.steps.get(self.pos) {
+            let st = &self.tour().stages[si];
+            ctx = format!("The reviewer is at stage \"{}\", step \"{}\".", st.title, st.steps[i].title);
+        }
+        if let Some((_, lens)) = about {
+            ctx.push_str(&format!(" They ask about this lens: {lens}."));
+        }
+        let message = format!("{ctx}\n\nQuestion: {q}");
+        if self.planning.is_some() {
+            self.chat.pending = Some(message);
+            return;
+        }
+        self.dispatch(message);
+    }
+
+    fn dispatch(&mut self, message: String) {
+        if self.agent.is_none()
+            && let Err(e) = self.start_agent()
+        {
+            self.chat.push_text(&format!("_{e}_"));
+            return;
+        }
+        let full = if self.needs_primer {
+            self.needs_primer = false;
+            format!("{}\n\n{message}", plan::primer(self.ws, &self.tours[self.current]))
+        } else {
+            message.clone()
+        };
+        self.last_question = Some(message);
+        self.turn_text = false;
+        if let Some(a) = &mut self.agent
+            && a.send(&full).is_ok()
+        {
+            self.chat.busy = true;
+            self.chat.status = "thinking".into();
+        } else {
+            self.chat.push_text("_could not reach the agent_");
+        }
+    }
+
+    fn on_chat_event(&mut self, e: agent::Event) {
+        match e {
+            agent::Event::Text(t) => {
+                self.turn_text = true;
+                self.chat.push_text(&t);
+            }
+            agent::Event::Tool(t) => self.chat.status = t,
+            agent::Event::TurnDone { ok } => {
+                self.chat.busy = false;
+                self.resuming = false;
+                if !ok {
+                    self.chat.push_text("\n\n_the agent reported an error_");
+                }
+                self.chat.save(self.chat_path().as_deref());
+            }
+            agent::Event::Exited(err) => {
+                self.agent = None;
+                self.events = None;
+                let retry = self.chat.busy && self.resuming && !self.turn_text;
+                self.chat.busy = false;
+                if retry {
+                    if let Some(c) = &mut self.config {
+                        c.session = None;
+                    }
+                    if let Some(q) = self.last_question.take() {
+                        self.dispatch(q);
+                    }
+                } else {
+                    let why = if err.is_empty() { "the agent stopped".to_string() } else { err };
+                    self.chat.push_text(&format!("\n\n_{why}_"));
+                }
+            }
+        }
     }
 
     fn tour(&self) -> &Tour {
@@ -140,7 +289,10 @@ impl<'a> App<'a> {
     }
 
     fn on_event(&mut self, e: agent::Event) {
-        let Some(p) = &mut self.planning else { return };
+        let Some(p) = &mut self.planning else {
+            self.on_chat_event(e);
+            return;
+        };
         let parsed = match e {
             agent::Event::Text(t) => p.parser.push(&t),
             agent::Event::Tool(t) => {
@@ -159,6 +311,8 @@ impl<'a> App<'a> {
             agent::Event::Exited(err) => {
                 p.error = Some(if err.is_empty() { "the agent stopped".into() } else { err });
                 self.agent = None;
+                self.events = None;
+                self.finish_planning();
                 return;
             }
         };
@@ -191,6 +345,13 @@ impl<'a> App<'a> {
     }
 
     fn finish_planning(&mut self) {
+        self.finish_plan_tour();
+        if let Some(q) = self.chat.pending.take() {
+            self.dispatch(q);
+        }
+    }
+
+    fn finish_plan_tour(&mut self) {
         let Some(p) = self.planning.take() else { return };
         if self.tours[AGENT].stages.is_empty() {
             self.notice = Some(format!(
@@ -236,6 +397,8 @@ impl<'a> App<'a> {
                     "down" => KeyCode::Down,
                     "up" => KeyCode::Up,
                     "pgdn" => KeyCode::PageDown,
+                    "enter" => KeyCode::Enter,
+                    "esc" => KeyCode::Esc,
                     _ => KeyCode::Null,
                 };
                 (code, end + 2)
@@ -323,16 +486,66 @@ impl<'a> App<'a> {
         self.scroll = (self.scroll as isize + d).clamp(0, max as isize) as usize;
     }
 
+    fn chat_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => self.chat.open = false,
+            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('u') if ctrl => self.chat.input.clear(),
+            KeyCode::Char('w') if ctrl => {
+                let t = self.chat.input.trim_end().len();
+                let cut = self.chat.input[..t].rfind(' ').map_or(0, |i| i + 1);
+                self.chat.input.truncate(cut);
+            }
+            KeyCode::Enter => self.ask(),
+            KeyCode::Backspace => {
+                self.chat.input.pop();
+            }
+            KeyCode::PageUp => self.chat.scroll += 5,
+            KeyCode::PageDown => self.chat.scroll = self.chat.scroll.saturating_sub(5),
+            KeyCode::Char(c) if !ctrl => self.chat.input.push(c),
+            _ => {}
+        }
+    }
+
+    fn open_chat(&mut self, about_lens: bool) {
+        self.chat.open = true;
+        self.chat.about = None;
+        if about_lens && let Some(spec) = self.focused_spec() {
+            let (res, diff) = self
+                .overrides
+                .get(&(self.pos, self.focus))
+                .copied()
+                .unwrap_or((spec.resolution, None));
+            let v = self.lenses.view(self.ws, &spec, res, diff);
+            let target = spec
+                .symbol
+                .clone()
+                .or(spec.hunk.clone())
+                .unwrap_or_default();
+            self.chat.about = Some((
+                format!("{} · {}", v.title, v.place),
+                format!("{} ({target}) at {}, shown at resolution {}", v.title, v.place, res.label()),
+            ));
+        }
+    }
+
     fn key(&mut self, k: KeyEvent) {
         if self.help {
             self.help = false;
+            return;
+        }
+        if self.chat.open {
+            self.chat_key(k);
             return;
         }
         self.notice = None;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let half = (self.view_height / 2).max(1) as isize;
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('c') if !ctrl => self.open_chat(false),
+            KeyCode::Char('a') => self.open_chat(true),
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('d') if ctrl => self.scroll_by(half),
             KeyCode::Char('u') if ctrl => self.scroll_by(-half),
@@ -377,7 +590,14 @@ impl<'a> App<'a> {
         if rail_w > 0 {
             self.draw_rail(f, rail);
         }
-        self.draw_main(f, main);
+        if self.chat.open {
+            let chat_h = (main.height * 45 / 100).max(8);
+            let [content, chat] = Layout::vertical([Constraint::Min(4), Constraint::Length(chat_h)]).areas(main);
+            self.draw_main(f, content);
+            self.draw_chat(f, chat);
+        } else {
+            self.draw_main(f, main);
+        }
         self.draw_status(f, status);
         if self.help {
             draw_help(f, area);
@@ -566,7 +786,51 @@ impl<'a> App<'a> {
         }
     }
 
+    fn draw_chat(&self, f: &mut Canvas, area: Rect) {
+        let busy = if self.chat.busy { " · answering" } else { "" };
+        let block = Frame::default()
+            .borders(Borders::TOP)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(MAUVE))
+            .title(Span::styled(format!(" ✦ chat{busy} "), Style::default().fg(MAUVE).add_modifier(Modifier::BOLD)))
+            .padding(Padding::horizontal(2));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let about_h = u16::from(self.chat.about.is_some());
+        let [log, about, input] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(about_h),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+        let lines = self.chat.transcript(log.width as usize);
+        let h = log.height as usize;
+        let end = lines.len().saturating_sub(self.chat.scroll.min(lines.len().saturating_sub(h)));
+        let start = end.saturating_sub(h);
+        f.render_widget(Paragraph::new(lines[start..end].to_vec()), log);
+        if let Some((label, _)) = &self.chat.about {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("about ", dim()),
+                    Span::styled(label.clone(), Style::default().fg(LAVENDER)),
+                ])),
+                about,
+            );
+        }
+        f.render_widget(Paragraph::new(self.chat.input_line()), input);
+    }
+
     fn draw_status(&self, f: &mut Canvas, area: Rect) {
+        if self.chat.open {
+            let keys = [("enter", "send"), ("esc", "close"), ("pgup/pgdn", "scroll"), ("ctrl-u", "clear")];
+            let mut spans = vec![Span::raw(" ")];
+            for (k, what) in keys {
+                spans.push(Span::styled(k, Style::default().fg(MAUVE).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(format!(" {what}   "), dim()));
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(MANTLE)), area);
+            return;
+        }
         let keys = [
             ("n/p", "step"),
             ("N/P", "stage"),
@@ -574,6 +838,8 @@ impl<'a> App<'a> {
             ("tab", "lens"),
             ("+/-", "zoom"),
             ("d", "diff"),
+            ("c", "chat"),
+            ("a", "ask"),
             ("A", "tour"),
             ("?", "help"),
             ("q", "quit"),
@@ -599,7 +865,10 @@ fn draw_help(f: &mut Canvas, area: Rect) {
         ("+  -", "zoom the lens: name, signature, skeleton, full"),
         ("d", "show or hide removed lines and markers"),
         ("A", "switch between the agent tour and the automatic tour"),
-        ("q  esc", "quit"),
+        ("c", "open the chat with the agent"),
+        ("a", "ask about the focused lens"),
+        ("esc", "close the chat or this help"),
+        ("q", "quit"),
     ];
     let lines: Vec<Line> = rows
         .iter()

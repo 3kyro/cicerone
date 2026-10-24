@@ -18,7 +18,9 @@ pub struct Agent {
     stdin: ChildStdin,
 }
 
-const TOOLS: &str = "Read Grep Glob Bash(git show:*) Bash(git log:*) Bash(git grep:*) Bash(git diff:*) Bash(git blame:*)";
+/// The diff under review can carry instructions, so the agent only gets
+/// read-only file tools: no shell, no MCP servers, no user settings.
+const TOOLS: &str = "Read,Grep,Glob";
 
 pub struct Options<'a> {
     pub cwd: &'a Path,
@@ -27,6 +29,7 @@ pub struct Options<'a> {
     pub system: &'a str,
     pub model: Option<&'a str>,
     pub log: Option<&'a Path>,
+    pub files: Option<&'a Path>,
 }
 
 impl Agent {
@@ -37,8 +40,12 @@ impl Agent {
             .args(["--include-partial-messages", "--verbose"])
             .args([if o.resume { "--resume" } else { "--session-id" }, o.session])
             .args(["--append-system-prompt", o.system])
-            .args(["--allowedTools", TOOLS])
-            .args(["--disallowedTools", "Edit Write NotebookEdit"]);
+            .args(["--restricted", "--strict-mcp-config"])
+            .args(["--tools", TOOLS])
+            .args(["--allowedTools", &TOOLS.replace(',', " ")]);
+        if let Some(d) = o.files {
+            cmd.arg("--add-dir").arg(d);
+        }
         if let Some(m) = o.model {
             cmd.args(["--model", m]);
         }

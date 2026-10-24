@@ -90,6 +90,7 @@ pub struct FileData {
 pub struct Workspace {
     pub manifest: Manifest,
     pub files: Vec<FileData>,
+    pub snapshot: Option<std::path::PathBuf>,
 }
 
 impl Workspace {
@@ -154,7 +155,11 @@ pub fn build(repo: &Repo, range: &Range) -> Result<Workspace> {
     let diffs: Vec<&FileDiff> = files.iter().map(|f| &f.diff).collect();
     classify_mechanical(&mut m, repo, range, &diffs)?;
     m.order = order(&m);
-    Ok(Workspace { manifest: m, files })
+    Ok(Workspace {
+        manifest: m,
+        files,
+        snapshot: None,
+    })
 }
 
 fn outline_all(files: &[FileData]) -> Vec<(Outline, Outline)> {

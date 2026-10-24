@@ -32,7 +32,7 @@ RULES
    - In the shapes stage, show functions at "signature" and changed types at "signature". Show a new type at "full" only when it is short.
    - Show a function longer than 15 lines first at "skeleton", with a label on each hole that hides something the reader must know. Show it at "full" only in a later step, with "focus" on the lines that matter.
    - Use "notes" for the one to three lines in a step that a reviewer must not miss.
-8. Use tools only to read context: git show <head>:<path>, git log, git grep, Read, Grep. Never edit anything.
+8. To read more context, use Read, Grep, and Glob on the FILES directory named in the material, and on the repository working tree. The working tree can differ from head.
 9. 4 to 8 stages. 1 to 4 lenses per step.
 
 CHAT
@@ -41,9 +41,30 @@ After the plan, the reviewer can send questions. Each question names the step an
 const MAX_DIFF: usize = 400_000;
 
 pub fn prompt(ws: &Workspace) -> String {
+    format!("Plan the tour for the change {}..{}.\n\n{}", ws.manifest.base, ws.manifest.head, material(ws))
+}
+
+/// The context for a chat session that did not plan the tour itself.
+pub fn primer(ws: &Workspace, tour: &Tour) -> String {
+    format!(
+        "Do not plan a tour. The reviewer reads this tour of the change {}..{} and asks you questions about it.\n\nTOUR\n{}\n\n{}",
+        ws.manifest.base,
+        ws.manifest.head,
+        serde_json::to_string(tour).unwrap_or_default(),
+        material(ws)
+    )
+}
+
+fn material(ws: &Workspace) -> String {
     let m = &ws.manifest;
     let mut s = String::new();
-    let _ = writeln!(s, "Plan the tour for the change {}..{}.\n", m.base, m.head);
+    if let Some(d) = &ws.snapshot {
+        let _ = writeln!(
+            s,
+            "FILES\nThe full base and head versions of the changed files are at {0}/base/<path> and {0}/head/<path>.\n",
+            d.display()
+        );
+    }
     let _ = writeln!(s, "MANIFEST\n{}\n", serde_json::to_string(m).unwrap_or_default());
     let _ = writeln!(s, "DIFF (hunks marked mechanical in the manifest are left out)");
     let mut left_out = 0;
@@ -71,7 +92,7 @@ pub fn prompt(ws: &Workspace) -> String {
         }
     }
     if left_out > 0 {
-        let _ = writeln!(s, "\n({left_out} hunks did not fit. Read them with git show {}.)", m.head);
+        let _ = writeln!(s, "\n({left_out} hunks did not fit. Read the files under FILES.)");
     }
     s
 }
@@ -186,6 +207,30 @@ fn shown_hunks<'a>(tour: &Tour, ws: &'a Workspace) -> BTreeSet<&'a str> {
     shown
 }
 
+/// Writes the base and head version of each changed file under `dir`, so
+/// the agent can read them without a shell.
+pub fn snapshot(ws: &Workspace, dir: &std::path::Path) -> std::io::Result<()> {
+    use std::path::Component;
+    for f in &ws.files {
+        for (side, path, content) in [
+            ("base", f.diff.base_path(), &f.base),
+            ("head", f.diff.path.as_str(), &f.head),
+        ] {
+            let rel = std::path::Path::new(path);
+            let Some(content) = content else { continue };
+            if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+                continue;
+            }
+            let target = dir.join(side).join(rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(target, content)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn save(tour: &Tour, cache: Option<&std::path::Path>) {
     if let Some(dir) = cache
         && std::fs::create_dir_all(dir).is_ok()
@@ -218,7 +263,7 @@ pub fn run_headless(
                     tour.glossary = glossary;
                 }
                 Parsed::Stage(s) => {
-                    eprintln!("stage: {}", s.title);
+                    eprintln!("stage: {}", crate::clean(&s.title));
                     tour.stages.push(s);
                 }
             }
@@ -227,7 +272,7 @@ pub fn run_headless(
     for e in rx {
         match e {
             Event::Text(t) => apply(parser.push(&t), &mut tour),
-            Event::Tool(t) => eprintln!("tool: {t}"),
+            Event::Tool(t) => eprintln!("tool: {}", crate::clean(&t)),
             Event::TurnDone { ok } => {
                 apply(parser.finish(), &mut tour);
                 anyhow::ensure!(ok, "the agent reported an error");
