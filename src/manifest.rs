@@ -80,7 +80,33 @@ pub struct Manifest {
     pub order: Vec<String>,
 }
 
-pub fn build(repo: &Repo, range: &Range) -> Result<Manifest> {
+pub struct FileData {
+    pub diff: FileDiff,
+    pub lang: Option<Lang>,
+    pub base: Option<String>,
+    pub head: Option<String>,
+}
+
+pub struct Workspace {
+    pub manifest: Manifest,
+    pub files: Vec<FileData>,
+}
+
+impl Workspace {
+    pub fn file(&self, path: &str) -> Option<&FileData> {
+        self.files.iter().find(|f| f.diff.path == path)
+    }
+
+    pub fn symbol(&self, id: &str) -> Option<&Symbol> {
+        self.manifest.symbols.iter().find(|s| s.id == id)
+    }
+
+    pub fn hunk(&self, id: &str) -> Option<&HunkEntry> {
+        self.manifest.hunks.iter().find(|h| h.id == id)
+    }
+}
+
+pub fn build(repo: &Repo, range: &Range) -> Result<Workspace> {
     let diff = crate::diff::parse(&repo.diff(range)?);
     let mut m = Manifest {
         base: range.base.clone(),
@@ -92,57 +118,74 @@ pub fn build(repo: &Repo, range: &Range) -> Result<Manifest> {
         order: Vec::new(),
     };
     let mut reqs: Vec<(Option<&str>, &str)> = Vec::new();
-    for file in &diff {
-        if Lang::of_path(&file.path).is_some() && !file.binary {
-            if file.status != FileStatus::Added {
-                reqs.push((Some(&range.base), file.base_path()));
-            }
-            if file.status != FileStatus::Deleted {
-                reqs.push((range.head.as_deref(), &file.path));
-            }
+    for file in diff.iter().filter(|f| !f.binary) {
+        if file.status != FileStatus::Added {
+            reqs.push((Some(&range.base), file.base_path()));
+        }
+        if file.status != FileStatus::Deleted {
+            reqs.push((range.head.as_deref(), &file.path));
         }
     }
     let mut contents = repo.show_many(&reqs)?.into_iter();
-    let mut sources: Vec<(Option<String>, Option<String>)> = Vec::new();
-    for file in &diff {
-        let mut side = |present: bool| if present { contents.next().flatten() } else { None };
-        if Lang::of_path(&file.path).is_some() && !file.binary {
-            let base = side(file.status != FileStatus::Added);
-            let head = side(file.status != FileStatus::Deleted);
-            sources.push((base, head));
-        } else {
-            sources.push((None, None));
-        }
+    let mut files: Vec<FileData> = Vec::new();
+    for file in diff {
+        let mut side = |present: bool| {
+            if present && !file.binary {
+                contents.next().flatten()
+            } else {
+                None
+            }
+        };
+        let base = side(file.status != FileStatus::Added);
+        let head = side(file.status != FileStatus::Deleted);
+        files.push(FileData {
+            lang: Lang::of_path(&file.path),
+            diff: file,
+            base,
+            head,
+        });
     }
-    let outlines: Vec<(Outline, Outline)> = std::thread::scope(|sc| {
-        let jobs: Vec<_> = diff
-            .iter()
-            .zip(&sources)
-            .map(|(file, (b, h))| {
-                sc.spawn(move || match Lang::of_path(&file.path) {
-                    Some(l) => (
-                        b.as_deref().map(|s| syntax::outline(l, s)).unwrap_or_default(),
-                        h.as_deref().map(|s| syntax::outline(l, s)).unwrap_or_default(),
-                    ),
-                    None => (Outline::default(), Outline::default()),
+    let outlines = outline_all(&files);
+    let mut refs: Vec<Scope> = Vec::new();
+    for (f, (base, head)) in files.iter().zip(&outlines) {
+        add_file(&mut m, &mut refs, &f.diff, f.lang, base, head);
+    }
+    link(&mut m, &refs);
+    let diffs: Vec<&FileDiff> = files.iter().map(|f| &f.diff).collect();
+    classify_mechanical(&mut m, repo, range, &diffs)?;
+    m.order = order(&m);
+    Ok(Workspace { manifest: m, files })
+}
+
+fn outline_all(files: &[FileData]) -> Vec<(Outline, Outline)> {
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let chunk = files.len().div_ceil(workers).max(1);
+    std::thread::scope(|sc| {
+        let jobs: Vec<_> = files
+            .chunks(chunk)
+            .map(|fs| {
+                sc.spawn(move || {
+                    fs.iter()
+                        .map(|f| match f.lang {
+                            Some(l) => (
+                                f.base.as_deref().map(|s| syntax::outline(l, s)).unwrap_or_default(),
+                                f.head.as_deref().map(|s| syntax::outline(l, s)).unwrap_or_default(),
+                            ),
+                            None => (Outline::default(), Outline::default()),
+                        })
+                        .collect::<Vec<_>>()
                 })
             })
             .collect();
-        jobs.into_iter().map(|j| j.join().expect("outline thread")).collect()
-    });
-    let mut refs: Vec<Scope> = Vec::new();
-    for (file, (base, head)) in diff.iter().zip(&outlines) {
-        add_file(&mut m, &mut refs, file, Lang::of_path(&file.path), base, head);
-    }
-    link(&mut m, &refs);
-    classify_mechanical(&mut m, repo, range, &diff)?;
-    m.order = order(&m);
-    Ok(m)
+        jobs.into_iter()
+            .flat_map(|j| j.join().expect("outline thread"))
+            .collect()
+    })
 }
 
 const MAX_LEFTOVERS: usize = 20;
 
-fn classify_mechanical(m: &mut Manifest, repo: &Repo, range: &Range, diff: &[FileDiff]) -> Result<()> {
+fn classify_mechanical(m: &mut Manifest, repo: &Repo, range: &Range, diff: &[&FileDiff]) -> Result<()> {
     let paths: Vec<&str> = diff.iter().map(|f| f.path.as_str()).collect();
     let generated: BTreeSet<String> = repo.generated(&paths)?.into_iter().collect();
     let places: BTreeMap<&str, Place> = m.hunks.iter().map(|h| (h.id.as_str(), h.place)).collect();

@@ -285,13 +285,37 @@ fn tokens(line: &str) -> Vec<(usize, usize)> {
     out
 }
 
+const MAX_LCS_CELLS: usize = 1 << 20;
+
+fn span(line: &str, ts: &[(usize, usize)]) -> String {
+    match (ts.first(), ts.last()) {
+        (Some(a), Some(b)) => crate::syntax::normalize(&line[a.0..b.1]),
+        _ => String::new(),
+    }
+}
+
 fn text(line: &str, t: (usize, usize)) -> &str {
     &line[t.0..t.1]
 }
 
 fn line_substitutions(old: &str, new: &str) -> Vec<Substitution> {
     let (to, tn) = (tokens(old), tokens(new));
+    let same = |a: &(usize, usize), b: &(usize, usize)| text(old, *a) == text(new, *b);
+    let prefix = to.iter().zip(&tn).take_while(|(a, b)| same(a, b)).count();
+    let suffix = to[prefix..]
+        .iter()
+        .rev()
+        .zip(tn[prefix..].iter().rev())
+        .take_while(|(a, b)| same(a, b))
+        .count();
+    let (to, tn) = (&to[prefix..to.len() - suffix], &tn[prefix..tn.len() - suffix]);
     let (n, m) = (to.len(), tn.len());
+    if n.saturating_mul(m) > MAX_LCS_CELLS {
+        return vec![Substitution {
+            old: span(old, to),
+            new: span(new, tn),
+        }];
+    }
     let mut lcs = vec![vec![0u32; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
@@ -302,12 +326,6 @@ fn line_substitutions(old: &str, new: &str) -> Vec<Substitution> {
             };
         }
     }
-    let span = |line: &str, ts: &[(usize, usize)]| -> String {
-        match (ts.first(), ts.last()) {
-            (Some(a), Some(b)) => crate::syntax::normalize(&line[a.0..b.1]),
-            _ => String::new(),
-        }
-    };
     let mut out = Vec::new();
     let (mut i, mut j) = (0, 0);
     let (mut ro, mut rn) = (i, j);
@@ -367,6 +385,15 @@ mod tests {
             line_substitutions("f (Foo.bar x)", "f (Baz.bar x) y"),
             vec![sub("Foo", "Baz"), sub("", "y")]
         );
+    }
+
+    #[test]
+    fn huge_lines_skip_the_lcs_table() {
+        let old = format!("a {} z", "x ".repeat(5000));
+        let new = format!("a {} z", "y ".repeat(5000));
+        let subs = line_substitutions(&old, &new);
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].old.starts_with("x x") && subs[0].new.starts_with("y y"));
     }
 
     #[test]

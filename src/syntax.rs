@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::collections::BTreeSet;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -18,7 +18,7 @@ impl Lang {
         }
     }
 
-    fn grammar(self) -> tree_sitter::Language {
+    pub fn grammar(self) -> tree_sitter::Language {
         match self {
             Lang::Haskell => tree_sitter_haskell::LANGUAGE.into(),
             Lang::Elm => tree_sitter_elm::LANGUAGE.into(),
@@ -62,6 +62,7 @@ pub struct Decl {
     pub start: usize,
     pub end: usize,
     pub signature: Option<String>,
+    pub sig_lines: Option<(usize, usize)>,
     pub text: String,
     pub refs: BTreeSet<String>,
 }
@@ -185,6 +186,7 @@ pub fn outline(lang: Lang, src: &str) -> Outline {
             prev.refs.extend(refs);
             if is_sig {
                 prev.signature = Some(text);
+                prev.sig_lines = Some((line_of(node.start_position().row), end));
             }
             continue;
         }
@@ -194,6 +196,7 @@ pub fn outline(lang: Lang, src: &str) -> Outline {
             start,
             end,
             signature: is_sig.then(|| text.clone()),
+            sig_lines: is_sig.then(|| (line_of(node.start_position().row), end)),
             text,
             refs,
         });
@@ -201,6 +204,67 @@ pub fn outline(lang: Lang, src: &str) -> Outline {
     for d in &mut out.decls {
         d.refs.remove(&d.name);
     }
+    out
+}
+
+pub fn parse(lang: Lang, src: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser.set_language(&lang.grammar()).ok()?;
+    parser.parse(src, None)
+}
+
+/// Lines in `start..=end` that carry the control flow of a declaration:
+/// equations, guards, case branches, if branches, local bindings, and do
+/// statements. A skeleton shows these lines and folds the rest.
+pub fn anchors(lang: Lang, tree: &Tree, start: usize, end: usize) -> BTreeSet<usize> {
+    let mut out = BTreeSet::new();
+    let (structural, branching, keywords): (&[&str], &[&str], &[&str]) = match lang {
+        Lang::Haskell => (
+            &[
+                "signature", "function", "bind", "match", "guards", "alternative", "statement",
+                "local_binds", "let", "let_in", "multi_way_if", "lambda_case", "lambda_cases",
+            ],
+            &["conditional"],
+            &["where", "in", "then", "else", "of"],
+        ),
+        Lang::Elm => (
+            &[
+                "type_annotation", "value_declaration", "case_of_branch", "let_in_expr",
+                "case_of_expr",
+            ],
+            &["if_else_expr"],
+            &["in", "then", "else", "of"],
+        ),
+    };
+    let mut stack = vec![(tree.root_node(), false)];
+    while let Some((node, in_list)) = stack.pop() {
+        let (s, e) = (line_of(node.start_position().row), line_of(node.end_position().row));
+        if e < start || s > end {
+            continue;
+        }
+        let kind = node.kind();
+        if structural.contains(&kind) || (!node.is_named() && keywords.contains(&kind)) {
+            out.insert(s);
+        }
+        if branching.contains(&kind) {
+            out.insert(s);
+            for c in named_children(node) {
+                out.insert(line_of(c.start_position().row));
+            }
+        }
+        let list = lang == Lang::Elm && kind == "list_expr";
+        if list && !in_list {
+            for c in named_children(node) {
+                out.insert(line_of(c.start_position().row));
+            }
+        }
+        if matches!(kind, "signature" | "type_annotation") {
+            continue;
+        }
+        let mut c = node.walk();
+        stack.extend(node.children(&mut c).map(|c| (c, in_list || list)));
+    }
+    out.retain(|l| (start..=end).contains(l));
     out
 }
 
@@ -355,6 +419,28 @@ instance Show Policy where
         assert_eq!(o.region_at(1), Some(Region::Header));
         assert_eq!(o.module.as_deref(), Some("A"));
         assert!(o.imports.contains("Data.Map"));
+    }
+
+    #[test]
+    fn haskell_skeleton_anchors() {
+        let src = "\
+check :: Policy -> Int -> Bool
+check policy k =
+  case policy of
+    RequireAll ->
+      allOf
+        k
+    RequireAny n
+      | n <= 0 -> False
+      | otherwise -> k >= n
+  where
+    allOf = const True
+";
+        let tree = parse(Lang::Haskell, src).unwrap();
+        let a: Vec<usize> = anchors(Lang::Haskell, &tree, 1, 11).into_iter().collect();
+        assert_eq!(a, vec![1, 2, 3, 4, 7, 8, 9, 10, 11]);
+        let o = outline(Lang::Haskell, src);
+        assert_eq!(o.decls[0].sig_lines, Some((1, 1)));
     }
 
     #[test]

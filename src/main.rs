@@ -1,15 +1,27 @@
+mod app;
 mod diff;
 mod git;
+mod highlight;
+mod lens;
 mod manifest;
 mod mechanical;
 mod syntax;
+mod theme;
+mod tour;
+mod view;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use manifest::{Change, Manifest, Place};
 use std::path::PathBuf;
 
 const USAGE: &str = "\
-usage: cicerone manifest [--json] [-C <dir>] [<range>]
+usage: cicerone [review] [--tour <file>] [-C <dir>] [<range>]
+       cicerone tour [-C <dir>] [<range>]
+       cicerone manifest [--json] [-C <dir>] [<range>]
+
+review     walk through the change in the terminal
+tour       print the automatic tour as JSON, a template for --tour
+manifest   print the changed symbols, hunks, and mechanical patterns
 
 <range>   A..B     changes from A to B
           A...B    changes on B since its merge base with A
@@ -17,32 +29,56 @@ usage: cicerone manifest [--json] [-C <dir>] [<range>]
           (none)   the working tree against HEAD";
 
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let Some(cmd) = args.next() else {
-        bail!("{USAGE}");
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = match args.first().map(String::as_str) {
+        Some("review" | "tour" | "manifest") => args.remove(0),
+        _ => "review".to_string(),
     };
-    if cmd != "manifest" {
-        bail!("{USAGE}");
-    }
-    let (mut json, mut dir, mut spec) = (false, PathBuf::from("."), None);
-    while let Some(a) = args.next() {
+    let (mut json, mut dir, mut spec, mut tour_file) = (false, PathBuf::from("."), None, None);
+    let mut snapshot: Option<String> = None;
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "--json" => json = true,
-            "-C" => dir = args.next().map(PathBuf::from).unwrap_or(dir),
+            "-C" => dir = it.next().map(PathBuf::from).unwrap_or(dir),
+            "--tour" => tour_file = it.next().map(PathBuf::from),
+            "--snapshot" => snapshot = it.next(),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
             }
+            s if s.starts_with('-') => bail!("unknown flag {s}\n\n{USAGE}"),
             _ => spec = Some(a),
         }
     }
+    let tour: Option<tour::Tour> = match &tour_file {
+        Some(p) => Some(
+            serde_json::from_str(&std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
+                .with_context(|| format!("parsing {}", p.display()))?,
+        ),
+        None => None,
+    };
     let repo = git::Repo::discover(&dir)?;
+    let spec = spec.or_else(|| tour.as_ref().and_then(|t| t.range.clone()));
     let range = repo.resolve(spec.as_deref())?;
-    let m = manifest::build(&repo, &range)?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&m)?);
-    } else {
-        print_text(&m);
+    std::thread::spawn(highlight::warm);
+    let ws = manifest::build(&repo, &range)?;
+    match cmd.as_str() {
+        "manifest" if json => println!("{}", serde_json::to_string_pretty(&ws.manifest)?),
+        "manifest" => print_text(&ws.manifest),
+        "tour" => println!("{}", serde_json::to_string_pretty(&tour::auto(&ws))?),
+        _ if snapshot.is_some() => {
+            let tour = tour.unwrap_or_else(|| tour::auto(&ws));
+            let keys = snapshot.unwrap_or_default();
+            print!("{}", app::App::new(&ws, tour).snapshot(&keys, 120, 40)?);
+        }
+        _ => {
+            let tour = tour.unwrap_or_else(|| tour::auto(&ws));
+            let mut terminal = ratatui::init();
+            let res = app::App::new(&ws, tour).run(&mut terminal);
+            ratatui::restore();
+            res?;
+        }
     }
     Ok(())
 }
