@@ -1,5 +1,6 @@
 use crate::diff::{FileDiff, FileStatus};
 use crate::git::{Range, Repo};
+use crate::mechanical::{self, Mechanical, Pattern};
 use crate::syntax::{self, Decl, DeclKind, Lang, Outline, Region};
 use anyhow::Result;
 use serde::Serialize;
@@ -28,6 +29,7 @@ pub struct Symbol {
     /// Head lines, or base lines for a removed symbol.
     pub lines: (usize, usize),
     pub hunks: Vec<String>,
+    pub mechanical: bool,
     pub uses: Vec<String>,
     pub used_by: Vec<String>,
 }
@@ -50,6 +52,7 @@ pub struct HunkEntry {
     pub added: usize,
     pub removed: usize,
     pub place: Place,
+    pub mechanical: Option<Mechanical>,
     pub symbols: Vec<String>,
 }
 
@@ -72,6 +75,7 @@ pub struct Manifest {
     pub files: Vec<FileEntry>,
     pub symbols: Vec<Symbol>,
     pub hunks: Vec<HunkEntry>,
+    pub patterns: Vec<Pattern>,
     /// Symbol ids, each one after the changed symbols that it uses.
     pub order: Vec<String>,
 }
@@ -84,34 +88,122 @@ pub fn build(repo: &Repo, range: &Range) -> Result<Manifest> {
         files: Vec::new(),
         symbols: Vec::new(),
         hunks: Vec::new(),
+        patterns: Vec::new(),
         order: Vec::new(),
     };
-    let mut refs: Vec<Scope> = Vec::new();
+    let mut reqs: Vec<(Option<&str>, &str)> = Vec::new();
     for file in &diff {
-        let lang = Lang::of_path(&file.path);
-        let (base, head) = match lang {
-            Some(l) if !file.binary => {
-                let load = |rev: Option<&str>, path: &str, absent: bool| {
-                    if absent {
-                        Outline::default()
-                    } else {
-                        repo.show(rev, path)
-                            .map(|s| syntax::outline(l, &s))
-                            .unwrap_or_default()
-                    }
-                };
-                (
-                    load(Some(&range.base), file.base_path(), file.status == FileStatus::Added),
-                    load(range.head.as_deref(), &file.path, file.status == FileStatus::Deleted),
-                )
+        if Lang::of_path(&file.path).is_some() && !file.binary {
+            if file.status != FileStatus::Added {
+                reqs.push((Some(&range.base), file.base_path()));
             }
-            _ => (Outline::default(), Outline::default()),
-        };
-        add_file(&mut m, &mut refs, file, lang, &base, &head);
+            if file.status != FileStatus::Deleted {
+                reqs.push((range.head.as_deref(), &file.path));
+            }
+        }
+    }
+    let mut contents = repo.show_many(&reqs)?.into_iter();
+    let mut sources: Vec<(Option<String>, Option<String>)> = Vec::new();
+    for file in &diff {
+        let mut side = |present: bool| if present { contents.next().flatten() } else { None };
+        if Lang::of_path(&file.path).is_some() && !file.binary {
+            let base = side(file.status != FileStatus::Added);
+            let head = side(file.status != FileStatus::Deleted);
+            sources.push((base, head));
+        } else {
+            sources.push((None, None));
+        }
+    }
+    let outlines: Vec<(Outline, Outline)> = std::thread::scope(|sc| {
+        let jobs: Vec<_> = diff
+            .iter()
+            .zip(&sources)
+            .map(|(file, (b, h))| {
+                sc.spawn(move || match Lang::of_path(&file.path) {
+                    Some(l) => (
+                        b.as_deref().map(|s| syntax::outline(l, s)).unwrap_or_default(),
+                        h.as_deref().map(|s| syntax::outline(l, s)).unwrap_or_default(),
+                    ),
+                    None => (Outline::default(), Outline::default()),
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().expect("outline thread")).collect()
+    });
+    let mut refs: Vec<Scope> = Vec::new();
+    for (file, (base, head)) in diff.iter().zip(&outlines) {
+        add_file(&mut m, &mut refs, file, Lang::of_path(&file.path), base, head);
     }
     link(&mut m, &refs);
+    classify_mechanical(&mut m, repo, range, &diff)?;
     m.order = order(&m);
     Ok(m)
+}
+
+const MAX_LEFTOVERS: usize = 20;
+
+fn classify_mechanical(m: &mut Manifest, repo: &Repo, range: &Range, diff: &[FileDiff]) -> Result<()> {
+    let paths: Vec<&str> = diff.iter().map(|f| f.path.as_str()).collect();
+    let generated: BTreeSet<String> = repo.generated(&paths)?.into_iter().collect();
+    let places: BTreeMap<&str, Place> = m.hunks.iter().map(|h| (h.id.as_str(), h.place)).collect();
+    let inputs: Vec<mechanical::Input> = diff
+        .iter()
+        .flat_map(|f| {
+            f.hunks.iter().map(|h| mechanical::Input {
+                file: &f.path,
+                hunk: h,
+                generated: generated.contains(&f.path),
+                in_imports: places.get(h.id.as_str()) == Some(&Place::Imports),
+            })
+        })
+        .collect();
+    let mut a = mechanical::analyse(&inputs);
+    let file_of: BTreeMap<&str, &str> = m.hunks.iter().map(|h| (h.id.as_str(), h.file.as_str())).collect();
+    let mut words: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut specs: BTreeSet<String> = BTreeSet::new();
+    for (i, p) in a.patterns.iter().enumerate() {
+        for s in &p.substitutions {
+            if mechanical::is_identifier(&s.old) && mechanical::is_identifier(&s.new) {
+                words.entry(s.old.as_str()).or_default().push(i);
+                for h in &p.hunks {
+                    let f = file_of[h.as_str()];
+                    specs.insert(match f.rsplit_once('.') {
+                        Some((_, ext)) if !ext.contains('/') => format!("*.{ext}"),
+                        _ => f.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    let ws: Vec<&str> = words.keys().copied().collect();
+    let specs: Vec<String> = specs.into_iter().collect();
+    let hits = repo.grep_words(range.head.as_deref(), &ws, &specs)?;
+    let mut leftovers: Vec<Vec<String>> = vec![Vec::new(); a.patterns.len()];
+    for (word, place) in hits {
+        for &i in words.get(word.as_str()).into_iter().flatten() {
+            if leftovers[i].len() < MAX_LEFTOVERS && !leftovers[i].contains(&place) {
+                leftovers[i].push(place.clone());
+            }
+        }
+    }
+    for (p, l) in a.patterns.iter_mut().zip(leftovers) {
+        p.leftovers = l;
+    }
+    for h in &mut m.hunks {
+        h.mechanical = a.kinds.remove(&h.id);
+    }
+    let mechanical_hunks: BTreeSet<&str> = m
+        .hunks
+        .iter()
+        .filter(|h| h.mechanical.is_some())
+        .map(|h| h.id.as_str())
+        .collect();
+    for s in &mut m.symbols {
+        s.mechanical = s.change == Change::Formatting
+            || (!s.hunks.is_empty() && s.hunks.iter().all(|h| mechanical_hunks.contains(h.as_str())));
+    }
+    m.patterns = a.patterns;
+    Ok(())
 }
 
 /// What a symbol refers to, and what its file can see.
@@ -161,6 +253,7 @@ fn add_file(
             old_signature: old.and_then(|o| o.signature.clone()),
             lines: (d.start, d.end),
             hunks: Vec::new(),
+            mechanical: false,
             uses: Vec::new(),
             used_by: Vec::new(),
         });
@@ -252,6 +345,7 @@ fn add_file(
             added: h.added(),
             removed: h.removed(),
             place,
+            mechanical: None,
             symbols: syms,
         });
     }
@@ -297,7 +391,12 @@ fn order(m: &Manifest) -> Vec<String> {
     let mut roots: Vec<usize> = (0..m.symbols.len()).collect();
     roots.sort_by_key(|&i| {
         let s = &m.symbols[i];
-        (!s.kind.is_type_level(), s.change == Change::Removed, std::cmp::Reverse(s.used_by.len()))
+        (
+            s.mechanical,
+            !s.kind.is_type_level(),
+            s.change == Change::Removed,
+            std::cmp::Reverse(s.used_by.len()),
+        )
     });
     let mut seen = vec![false; m.symbols.len()];
     let mut out = Vec::new();

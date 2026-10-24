@@ -1,6 +1,7 @@
 mod diff;
 mod git;
 mod manifest;
+mod mechanical;
 mod syntax;
 
 use anyhow::{Result, bail};
@@ -46,66 +47,83 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn clean(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { char::REPLACEMENT_CHARACTER } else { c })
+        .collect()
+}
+
+fn label<T: serde::Serialize>(v: T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
 fn print_text(m: &Manifest) {
     let hunks: usize = m.files.iter().map(|f| f.hunks.len()).sum();
     println!(
         "{}..{} · {} files · {} hunks · {} symbols\n",
-        m.base,
-        m.head,
+        clean(&m.base),
+        clean(&m.head),
         m.files.len(),
         hunks,
         m.symbols.len()
     );
-    if !m.order.is_empty() {
-        println!("Symbols, names before uses");
-        for id in &m.order {
-            let s = m.symbols.iter().find(|s| &s.id == id).unwrap();
-            let mark = match s.change {
-                Change::Added => "+",
-                Change::Removed => "-",
-                Change::SignatureChanged => "±",
-                Change::BodyChanged => "~",
-                Change::DocChanged => "d",
-                Change::Formatting => "f",
-            };
-            let kind = serde_json::to_value(s.kind).unwrap();
-            println!(
-                "  {:<4} {} {:<9} {:<30} {}:{}-{}  {}{}",
-                s.id,
-                mark,
-                kind.as_str().unwrap_or(""),
-                s.name,
-                s.file,
-                s.lines.0,
-                s.lines.1,
-                s.hunks.join(" "),
-                if s.uses.is_empty() {
-                    String::new()
-                } else {
-                    format!("  uses {}", s.uses.join(" "))
-                }
-            );
-            if s.change == Change::SignatureChanged {
-                if let Some(o) = &s.old_signature {
-                    println!("         was {}", syntax::normalize(o));
-                }
-                if let Some(n) = &s.signature {
-                    println!("         now {}", syntax::normalize(n));
-                }
+    let symbol = |id: &String| m.symbols.iter().find(|s| &s.id == id).unwrap();
+    let (core, mech): (Vec<_>, Vec<_>) = m.order.iter().map(symbol).partition(|s| !s.mechanical);
+    let print_symbol = |s: &manifest::Symbol| {
+        let mark = match s.change {
+            Change::Added => "+",
+            Change::Removed => "-",
+            Change::SignatureChanged => "±",
+            Change::BodyChanged => "~",
+            Change::DocChanged => "d",
+            Change::Formatting => "f",
+        };
+        println!(
+            "  {:<4} {} {:<9} {:<30} {}:{}-{}  {}{}",
+            s.id,
+            mark,
+            label(s.kind),
+            clean(&s.name),
+            clean(&s.file),
+            s.lines.0,
+            s.lines.1,
+            s.hunks.join(" "),
+            if s.uses.is_empty() {
+                String::new()
+            } else {
+                format!("  uses {}", s.uses.join(" "))
+            }
+        );
+        if s.change == Change::SignatureChanged {
+            if let Some(o) = &s.old_signature {
+                println!("         was {}", clean(&syntax::normalize(o)));
+            }
+            if let Some(n) = &s.signature {
+                println!("         now {}", clean(&syntax::normalize(n)));
             }
         }
+    };
+    if !core.is_empty() {
+        println!("Symbols, names before uses");
+        core.into_iter().for_each(print_symbol);
         println!();
     }
-    let loose: Vec<_> = m.hunks.iter().filter(|h| h.place != Place::Symbols).collect();
+    let loose: Vec<_> = m
+        .hunks
+        .iter()
+        .filter(|h| h.place != Place::Symbols && h.mechanical.is_none())
+        .collect();
     if !loose.is_empty() {
         println!("Hunks outside symbols");
         for h in loose {
-            let place = serde_json::to_value(h.place).unwrap();
             println!(
                 "  {:<4} {:<8} {}:{}  +{} -{}",
                 h.id,
-                place.as_str().unwrap_or(""),
-                h.file,
+                label(h.place),
+                clean(&h.file),
                 h.new.0,
                 h.added,
                 h.removed
@@ -113,16 +131,80 @@ fn print_text(m: &Manifest) {
         }
         println!();
     }
+    let of_kind = |k: &str| -> Vec<&str> {
+        m.hunks
+            .iter()
+            .filter(|h| h.mechanical.as_ref().is_some_and(|x| label_kind(x) == k))
+            .map(|h| h.id.as_str())
+            .collect()
+    };
+    let (gen_, fmt, imp) = (of_kind("generated"), of_kind("formatting"), of_kind("imports"));
+    if !m.patterns.is_empty() || !gen_.is_empty() || !fmt.is_empty() || !imp.is_empty() || !mech.is_empty() {
+        println!("Mechanical");
+        for p in &m.patterns {
+            let subs: Vec<String> = p
+                .substitutions
+                .iter()
+                .map(|s| format!("{} → {}", show(&s.old), show(&s.new)))
+                .collect();
+            println!(
+                "  {:<4} {}   {} sites, {} hunks, {} files  ✓",
+                p.id,
+                clean(&subs.join(", ")),
+                p.sites,
+                p.hunks.len(),
+                p.files
+            );
+            println!("         {}", p.hunks.join(" "));
+            for o in &p.outliers {
+                println!("       ⚠ outlier {}: {}", o.hunk, clean(&o.reason));
+            }
+            if !p.leftovers.is_empty() {
+                let more = if p.leftovers.len() > 3 {
+                    format!(" …{} total", p.leftovers.len())
+                } else {
+                    String::new()
+                };
+                println!(
+                    "       ⚠ old name still in head: {}{}",
+                    clean(&p.leftovers[..p.leftovers.len().min(3)].join(" ")),
+                    more
+                );
+            }
+        }
+        for (name, ids) in [("formatting", &fmt), ("imports", &imp), ("generated", &gen_)] {
+            if !ids.is_empty() {
+                println!("  {:<11} {}", name, ids.join(" "));
+            }
+        }
+        if !mech.is_empty() {
+            let ids: Vec<&str> = mech.iter().map(|s| s.id.as_str()).collect();
+            println!("  symbols     {}", ids.join(" "));
+        }
+        println!();
+    }
     println!("Files");
     for f in &m.files {
-        let status = serde_json::to_value(f.status).unwrap();
         println!(
             "  {:<9} {}  +{} -{}  {}",
-            status.as_str().unwrap_or(""),
-            f.path,
+            label(f.status),
+            clean(&f.path),
             f.added,
             f.removed,
             f.hunks.join(" ")
         );
     }
+}
+
+fn label_kind(k: &mechanical::Mechanical) -> &'static str {
+    match k {
+        mechanical::Mechanical::Generated => "generated",
+        mechanical::Mechanical::Formatting => "formatting",
+        mechanical::Mechanical::Imports => "imports",
+        mechanical::Mechanical::Pattern(_) => "pattern",
+    }
+}
+
+fn show(s: &str) -> String {
+    if s.is_empty() { "∅".into() } else { format!("`{s}`") }
 }
