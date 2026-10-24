@@ -262,7 +262,7 @@ pub fn map(ws: &Workspace, w: usize) -> Lines {
         out.push(Line::from(truncate(
             vec![
                 Span::styled(format!("{icon} "), style),
-                Span::styled(format!("{dir}/"), dim()),
+                Span::styled(if dir.is_empty() { String::new() } else { format!("{dir}/") }, dim()),
                 Span::styled(name.to_string(), text().add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  +{}", f.added), Style::default().fg(GREEN)),
                 Span::styled(format!(" -{}", f.removed), Style::default().fg(RED)),
@@ -457,6 +457,72 @@ pub fn mechanical(ws: &Workspace, w: usize) -> Lines {
             let mut spans = vec![Span::raw("  ")];
             spans.extend(l.spans.into_iter().map(|s| s.style(dim())));
             out.push(Line::from(spans));
+        }
+    }
+    out
+}
+
+const GROUP_LINES: usize = 6;
+
+pub fn group(ws: &Workspace, g: &crate::tour::Group, w: usize) -> Lines {
+    let mut out = Vec::new();
+    if !g.title.is_empty() {
+        out.push(Line::from(vec![
+            Span::styled(g.title.clone(), Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {} hunks", g.hunks.len()), dim()),
+        ]));
+    }
+    if !g.text.is_empty() {
+        out.extend(markdown(&g.text, w));
+    }
+    for id in &g.hunks {
+        let Some(h) = ws.hunk(id) else {
+            out.push(Line::from(Span::styled(format!("  {id} not found"), dim())));
+            continue;
+        };
+        let names: Vec<&str> = h
+            .symbols
+            .iter()
+            .filter_map(|s| ws.symbol(s))
+            .map(|s| s.name.as_str())
+            .collect();
+        out.push(Line::from(truncate(
+            vec![
+                Span::styled(format!("{:<5}", h.id), Style::default().fg(SURFACE)),
+                Span::styled(format!("{}:{}", short(&h.file), h.new.0), Style::default().fg(SUBTEXT)),
+                Span::styled(
+                    if names.is_empty() { String::new() } else { format!("  {}", names.join(", ")) },
+                    Style::default().fg(LAVENDER),
+                ),
+            ],
+            w,
+        )));
+        let lines: Vec<&String> = ws
+            .file(&h.file)
+            .and_then(|f| f.diff.hunks.iter().find(|x| x.id == h.id))
+            .map(|x| x.lines.iter().filter(|l| l.starts_with('+') || l.starts_with('-')).collect())
+            .unwrap_or_default();
+        for l in lines.iter().take(GROUP_LINES) {
+            let (style, bg) = if l.starts_with('+') {
+                (Style::default().fg(GREEN), ADD_BG)
+            } else {
+                (Style::default().fg(RED), DEL_BG)
+            };
+            let text = l[1..].replace('\t', " ");
+            out.push(Line::from(truncate(
+                vec![
+                    Span::raw("     "),
+                    Span::styled(format!("{} ", &l[..1]), style.bg(bg)),
+                    Span::styled(text, Style::default().fg(TEXT).bg(bg)),
+                ],
+                w,
+            )));
+        }
+        if lines.len() > GROUP_LINES {
+            out.push(Line::from(Span::styled(
+                format!("     ⋯ {} more changed lines", lines.len() - GROUP_LINES),
+                dim().add_modifier(Modifier::ITALIC),
+            )));
         }
     }
     out

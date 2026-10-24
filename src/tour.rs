@@ -49,6 +49,16 @@ pub enum Block {
     Glossary,
     Pattern(String),
     Mechanical,
+    Group(Group),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub text: String,
+    pub hunks: Vec<String>,
 }
 
 const SKELETON_MIN_FOLD: usize = 4;

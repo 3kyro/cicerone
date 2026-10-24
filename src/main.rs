@@ -99,8 +99,8 @@ fn main() -> Result<()> {
                 .head
                 .as_deref()
                 .and_then(|h| plan::cache_dir(&repo.root, &range.base, h));
-            let (_agent, rx, _) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
-            let t = plan::run_headless(&ws, rx, cache.as_deref())?;
+            let (mut agent, rx, _) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
+            let t = plan::run_headless(&ws, &mut agent, rx, cache.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&t)?);
         }
         _ if snapshot.is_some() => {
@@ -117,7 +117,11 @@ fn main() -> Result<()> {
                 .as_ref()
                 .filter(|_| !replan)
                 .and_then(|d| std::fs::read_to_string(d.join("tour.json")).ok())
-                .and_then(|j| serde_json::from_str(&j).ok());
+                .and_then(|j| serde_json::from_str::<tour::Tour>(&j).ok())
+                .map(|mut t| {
+                    plan::refresh(&mut t, &ws);
+                    t
+                });
             let session = cache
                 .as_ref()
                 .and_then(|d| std::fs::read_to_string(d.join("session")).ok())

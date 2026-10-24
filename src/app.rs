@@ -23,6 +23,7 @@ const AGENT: usize = 1;
 
 struct Planning {
     parser: plan::Parser,
+    covering: bool,
     status: String,
     error: Option<String>,
     started: Instant,
@@ -120,6 +121,7 @@ impl<'a> App<'a> {
         self.events = Some(events);
         self.planning = Some(Planning {
             parser: plan::Parser::default(),
+            covering: false,
             status: "reading the change".into(),
             error: None,
             started: Instant::now(),
@@ -301,10 +303,24 @@ impl<'a> App<'a> {
             }
             agent::Event::TurnDone { ok } => {
                 let rest = p.parser.finish();
+                let covering = p.covering;
                 if !ok {
                     p.error = Some("the agent reported an error".into());
                 }
                 self.apply(rest);
+                if ok && !covering && !self.tours[AGENT].stages.is_empty() {
+                    let missing = plan::uncovered(&self.tours[AGENT], self.ws);
+                    if !missing.is_empty() {
+                        let msg = plan::coverage_prompt(self.ws, &missing);
+                        if let (Some(a), Some(p)) = (&mut self.agent, &mut self.planning)
+                            && a.send(&msg).is_ok()
+                        {
+                            p.covering = true;
+                            p.status = format!("grouping {} more hunks", missing.len());
+                            return;
+                        }
+                    }
+                }
                 self.finish_planning();
                 return;
             }
@@ -747,6 +763,7 @@ impl<'a> App<'a> {
                 Block::Glossary => out.extend(view::glossary(self.ws, &self.tours[self.current], w)),
                 Block::Pattern(id) => out.extend(view::pattern(self.ws, id, w)),
                 Block::Mechanical => out.extend(view::mechanical(self.ws, w)),
+                Block::Group(g) => out.extend(view::group(self.ws, g, w)),
                 Block::Lens(spec) => {
                     let (res, diff) = self
                         .overrides

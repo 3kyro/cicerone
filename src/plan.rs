@@ -1,4 +1,3 @@
-use crate::lens::LensSpec;
 use crate::manifest::Workspace;
 use crate::tour::{self, Block, Gloss, Stage, Tour};
 use serde::Deserialize;
@@ -14,7 +13,8 @@ PLANNING OUTPUT: JSON Lines only. One JSON object per line. No prose, no code fe
 First line: {"tour":{"title":"...","intent":"one sentence: what the change does and why","glossary":[{"name":"...","meaning":"one short sentence","symbol":"S3"}]}}
 Then one line per stage, written as soon as the stage is ready: {"stage":{"title":"...","steps":[{"title":"...","text":"markdown","blocks":[...]}]}}
 
-Blocks: "map" (the change map) | "glossary" (the glossary from the first line) | {"text":"markdown"} | {"lens":{...}} | {"pattern":"P1"}
+Blocks: "map" (the change map) | "glossary" (the glossary from the first line) | {"text":"markdown"} | {"lens":{...}} | {"pattern":"P1"} | {"group":{"title":"...","text":"markdown","hunks":["H3","H9"]}}
+A group lists many hunks compactly: only their changed lines, no context. Use it for hunks that make the same kind of change.
 Lens target, exactly one of: {"symbol":"S4"} | {"hunk":"H12"} | {"file":"path","lines":[a,b]}
 Lens options: "resolution": "name" | "signature" | "skeleton" | "full" (default full). "holes": [{"lines":[a,b],"label":"..."}] names the parts a skeleton or signature folds. "focus": [[a,b]] highlights lines. "notes": [{"line":n,"text":"..."}] puts a margin note under a line. "diff": false hides removed lines.
 Resolutions: name = one line. signature = the type signature, body folded (for a changed type: the changed lines with context). skeleton = control flow only: equations, guards, case branches, if branches, let/where bindings, do statements; the rest folds into holes. full = every line, removed lines in place.
@@ -26,7 +26,8 @@ RULES
 3. A symbol can come back in a later stage at a higher resolution. That is good: the reader sees a known shape open up.
 4. Text is short. Say why, and how the parts fit together. Do not narrate the code line by line. Markdown: `code`, **bold**, "- " bullets.
 5. Use only the symbol, hunk, and pattern ids in the manifest.
-6. Leave out mechanical hunks and patterns: cicerone appends a mechanical stage and a stage for every hunk that the tour does not show. Try to show every hunk that is not mechanical.
+6. Leave out mechanical hunks and patterns: cicerone appends a mechanical stage. Every other hunk must appear in the tour, in a lens or in a group.
+   When many hunks make the same kind of change (for example, every handler moves to a new API), show one or two of them as lenses, then put all of them in one group in the same step, with a text that names the shared change and any site that differs.
 7. Zoom, do not dump. This is the point of the tool:
    - Prefer symbol lenses. Use a hunk lens only for a hunk outside every symbol (imports, exports, non-code files).
    - In the shapes stage, show functions at "signature" and changed types at "signature". Show a new type at "full" only when it is short.
@@ -34,6 +35,9 @@ RULES
    - Use "notes" for the one to three lines in a step that a reviewer must not miss.
 8. To read more context, use Read, Grep, and Glob on the FILES directory named in the material, and on the repository working tree. The working tree can differ from head.
 9. 4 to 8 stages. 1 to 4 lenses per step.
+
+COVERAGE
+After the plan, cicerone can send the hunks that the tour does not show yet. Answer with JSON Lines only: one or more {"stage":{...}} lines whose steps sort those hunks into "group" blocks by what they do. Each listed hunk goes into exactly one group. Use lenses only for a hunk that a reviewer must read in full.
 
 CHAT
 After the plan, the reviewer can send questions. Each question names the step and the lens they are looking at. Answer in short markdown for a terminal: plain sentences, `code`, bullets. No headings, no tables, no JSON."#;
@@ -155,8 +159,44 @@ fn parse_line(line: &str) -> Option<Parsed> {
     }
 }
 
+pub const LEFT_OUT: &str = "Left out by the tour";
+
+/// Hunks that are not mechanical and that no lens or group of the tour shows.
+pub fn uncovered<'a>(tour: &Tour, ws: &'a Workspace) -> Vec<&'a crate::manifest::HunkEntry> {
+    let shown = shown_hunks(tour, ws);
+    ws.manifest
+        .hunks
+        .iter()
+        .filter(|h| h.mechanical.is_none() && !shown.contains(h.id.as_str()))
+        .collect()
+}
+
+pub fn coverage_prompt(ws: &Workspace, missing: &[&crate::manifest::HunkEntry]) -> String {
+    let mut s = format!(
+        "The tour does not show these {} hunks yet. Sort them into groups by what they do, as COVERAGE in the system prompt says. Their diff is in the first message.\n",
+        missing.len()
+    );
+    for h in missing {
+        let names: Vec<&str> = h
+            .symbols
+            .iter()
+            .filter_map(|id| ws.symbol(id))
+            .map(|x| x.name.as_str())
+            .collect();
+        let _ = writeln!(s, "{} {}:{} +{} -{} {}", h.id, h.file, h.new.0, h.added, h.removed, names.join(","));
+    }
+    s
+}
+
+/// Rebuilds the stages that cicerone owns, so a cached tour follows the
+/// current mechanical analysis.
+pub fn refresh(tour: &mut Tour, ws: &Workspace) {
+    tour.stages.retain(|s| s.title != "Mechanical" && s.title != LEFT_OUT && s.title != "Not covered yet");
+    complete(tour, ws);
+}
+
 /// Appends the mechanical stage and a stage for every hunk that the tour
-/// does not show, so nothing escapes the review.
+/// still does not show, so nothing escapes the review.
 pub fn complete(tour: &mut Tour, ws: &Workspace) {
     let auto = tour::auto(ws);
     if let Some(mech) = auto.stages.iter().find(|s| s.title == "Mechanical")
@@ -164,26 +204,26 @@ pub fn complete(tour: &mut Tour, ws: &Workspace) {
     {
         tour.stages.push(mech.clone());
     }
-    let shown = shown_hunks(tour, ws);
-    let mut missing: Vec<(&str, Vec<&str>)> = Vec::new();
-    for h in &ws.manifest.hunks {
-        if h.mechanical.is_some() || shown.contains(h.id.as_str()) {
-            continue;
-        }
+    let mut missing: Vec<(&str, Vec<String>)> = Vec::new();
+    for h in uncovered(tour, ws) {
         match missing.iter_mut().find(|(f, _)| *f == h.file) {
-            Some((_, v)) => v.push(&h.id),
-            None => missing.push((&h.file, vec![&h.id])),
+            Some((_, v)) => v.push(h.id.clone()),
+            None => missing.push((&h.file, vec![h.id.clone()])),
         }
     }
     if !missing.is_empty() {
         tour.stages.push(Stage {
-            title: "Not covered yet".into(),
+            title: LEFT_OUT.into(),
             steps: missing
                 .into_iter()
-                .map(|(file, hs)| tour::Step {
+                .map(|(file, hunks)| tour::Step {
                     title: tour::short(file),
                     text: String::new(),
-                    blocks: hs.into_iter().map(|h| Block::Lens(LensSpec::hunk(h))).collect(),
+                    blocks: vec![Block::Group(tour::Group {
+                        title: String::new(),
+                        text: String::new(),
+                        hunks,
+                    })],
                 })
                 .collect(),
         });
@@ -193,6 +233,14 @@ pub fn complete(tour: &mut Tour, ws: &Workspace) {
 fn shown_hunks<'a>(tour: &Tour, ws: &'a Workspace) -> BTreeSet<&'a str> {
     let mut shown = BTreeSet::new();
     for b in tour.stages.iter().flat_map(|s| &s.steps).flat_map(|s| &s.blocks) {
+        if let Block::Group(g) = b {
+            for id in &g.hunks {
+                if let Some(h) = ws.hunk(id) {
+                    shown.insert(h.id.as_str());
+                }
+            }
+            continue;
+        }
         let Block::Lens(l) = b else { continue };
         for h in &ws.manifest.hunks {
             let hit = l.hunk.as_deref() == Some(h.id.as_str())
@@ -242,6 +290,7 @@ pub fn save(tour: &Tour, cache: Option<&std::path::Path>) {
 
 pub fn run_headless(
     ws: &Workspace,
+    agent: &mut crate::agent::Agent,
     rx: std::sync::mpsc::Receiver<crate::agent::Event>,
     cache: Option<&std::path::Path>,
 ) -> anyhow::Result<Tour> {
@@ -269,6 +318,7 @@ pub fn run_headless(
             }
         }
     };
+    let mut covering = false;
     for e in rx {
         match e {
             Event::Text(t) => apply(parser.push(&t), &mut tour),
@@ -276,12 +326,18 @@ pub fn run_headless(
             Event::TurnDone { ok } => {
                 apply(parser.finish(), &mut tour);
                 anyhow::ensure!(ok, "the agent reported an error");
-                break;
+                anyhow::ensure!(!tour.stages.is_empty(), "the agent returned no stages");
+                let missing = uncovered(&tour, ws);
+                if covering || missing.is_empty() {
+                    break;
+                }
+                eprintln!("coverage: {} hunks", missing.len());
+                agent.send(&coverage_prompt(ws, &missing))?;
+                covering = true;
             }
             Event::Exited(err) => anyhow::bail!("the agent stopped: {err}"),
         }
     }
-    anyhow::ensure!(!tour.stages.is_empty(), "the agent returned no stages");
     complete(&mut tour, ws);
     save(&tour, cache);
     Ok(tour)

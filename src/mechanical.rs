@@ -48,6 +48,8 @@ pub struct Analysis {
 }
 
 const MIN_HUNKS: usize = 2;
+const MIN_HUNKS_ONE_SIDED: usize = 3;
+const MIN_STATEMENT_WORDS: usize = 3;
 
 type Subs = Option<Vec<(Substitution, usize)>>;
 
@@ -73,7 +75,10 @@ pub fn analyse(inputs: &[Input]) -> Analysis {
     }
     let mut frequent: BTreeSet<&Substitution> = atom_hunks
         .iter()
-        .filter(|(_, hs)| hs.len() >= MIN_HUNKS)
+        .filter(|(s, hs)| {
+            let one_sided = s.old.is_empty() || s.new.is_empty();
+            hs.len() >= if one_sided { MIN_HUNKS_ONE_SIDED } else { MIN_HUNKS }
+        })
         .map(|(s, _)| *s)
         .collect();
 
@@ -194,11 +199,20 @@ fn assign(
 }
 
 impl Substitution {
-    /// Both sides carry a word. Pure insertions, pure deletions, and
-    /// punctuation edits do not repeat in a way a reader can skim.
+    /// Both sides carry a word, or the one non-empty side is a whole
+    /// statement. Short insertions, short deletions, and punctuation edits
+    /// recur by chance and do not make a pattern a reader can skim.
     fn is_rewrite(&self) -> bool {
         let wordy = |s: &str| s.chars().any(char::is_alphanumeric);
-        wordy(&self.old) && wordy(&self.new)
+        let statement = |s: &str| {
+            s.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '\''))
+                .filter(|w| is_identifier(w))
+                .count()
+                >= MIN_STATEMENT_WORDS
+        };
+        (wordy(&self.old) && wordy(&self.new))
+            || (self.old.is_empty() && statement(&self.new))
+            || (self.new.is_empty() && statement(&self.old))
     }
 }
 
@@ -220,41 +234,42 @@ fn is_formatting(h: &Hunk) -> bool {
     changed && squash('-') == squash('+')
 }
 
-/// The token substitutions of a hunk, with their counts, or `None` when
-/// a block of the hunk does not pair removed lines one to one with added
-/// lines.
+/// The token substitutions of a hunk, with their counts. A block pairs its
+/// removed and added lines one to one when the counts match; otherwise each
+/// side is joined into one line, so a rewrite that changes the line count
+/// (five lines into one) still yields the same substitutions at every site.
 fn substitutions(h: &Hunk) -> Option<Vec<(Substitution, usize)>> {
     let mut counts: BTreeMap<Substitution, usize> = BTreeMap::new();
     let (mut olds, mut news): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
-    let mut flush = |olds: &mut Vec<&str>, news: &mut Vec<&str>| -> bool {
-        if olds.len() != news.len() {
-            return false;
-        }
-        for (o, n) in olds.iter().zip(news.iter()) {
-            for s in line_substitutions(o, n) {
+    let mut flush = |olds: &mut Vec<&str>, news: &mut Vec<&str>| {
+        if olds.len() == news.len() {
+            for (o, n) in olds.iter().zip(news.iter()) {
+                for s in line_substitutions(o, n) {
+                    *counts.entry(s).or_default() += 1;
+                }
+            }
+        } else {
+            for s in line_substitutions(&olds.join(" "), &news.join(" ")) {
                 *counts.entry(s).or_default() += 1;
             }
         }
         olds.clear();
         news.clear();
-        true
     };
     for l in &h.lines {
         if let Some(o) = l.strip_prefix('-') {
-            if !news.is_empty() && !flush(&mut olds, &mut news) {
-                return None;
+            if !news.is_empty() {
+                flush(&mut olds, &mut news);
             }
             olds.push(o);
         } else if let Some(n) = l.strip_prefix('+') {
             news.push(n);
-        } else if !flush(&mut olds, &mut news) {
-            return None;
+        } else {
+            flush(&mut olds, &mut news);
         }
     }
-    if !flush(&mut olds, &mut news) || counts.is_empty() {
-        return None;
-    }
-    Some(counts.into_iter().collect())
+    flush(&mut olds, &mut news);
+    (!counts.is_empty()).then(|| counts.into_iter().collect())
 }
 
 fn tokens(line: &str) -> Vec<(usize, usize)> {
@@ -403,8 +418,11 @@ mod tests {
     }
 
     #[test]
-    fn unpaired_blocks_are_not_substitutions() {
-        assert_eq!(substitutions(&hunk("H1", &["-a", "+b", "+c"])), None);
+    fn blocks_with_different_line_counts_are_joined() {
+        assert_eq!(
+            substitutions(&hunk("H1", &["-x <-", "-  get k", "+y <- req k"])),
+            Some(vec![(sub("get", "req"), 1), (sub("x", "y"), 1)])
+        );
         assert_eq!(
             substitutions(&hunk("H1", &[" ctx", "-a x", "+b x", " ctx", "-a y", "+b y"])),
             Some(vec![(sub("a", "b"), 2)])
