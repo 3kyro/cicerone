@@ -1,3 +1,4 @@
+mod agent;
 mod app;
 mod diff;
 mod git;
@@ -5,6 +6,7 @@ mod highlight;
 mod lens;
 mod manifest;
 mod mechanical;
+mod plan;
 mod syntax;
 mod theme;
 mod tour;
@@ -15,12 +17,15 @@ use manifest::{Change, Manifest, Place};
 use std::path::PathBuf;
 
 const USAGE: &str = "\
-usage: cicerone [review] [--tour <file>] [-C <dir>] [<range>]
+usage: cicerone [review] [--tour <file>] [--no-agent] [--replan] [--model <m>] [-C <dir>] [<range>]
        cicerone tour [-C <dir>] [<range>]
+       cicerone plan [--model <m>] [-C <dir>] [<range>]
        cicerone manifest [--json] [-C <dir>] [<range>]
 
-review     walk through the change in the terminal
+review     walk through the change in the terminal; an agent plans the tour
+           (cached per range), --no-agent uses the automatic tour
 tour       print the automatic tour as JSON, a template for --tour
+plan       let the agent plan the tour, cache it, and print it as JSON
 manifest   print the changed symbols, hunks, and mechanical patterns
 
 <range>   A..B     changes from A to B
@@ -31,11 +36,12 @@ manifest   print the changed symbols, hunks, and mechanical patterns
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = match args.first().map(String::as_str) {
-        Some("review" | "tour" | "manifest") => args.remove(0),
+        Some("review" | "tour" | "manifest" | "plan") => args.remove(0),
         _ => "review".to_string(),
     };
     let (mut json, mut dir, mut spec, mut tour_file) = (false, PathBuf::from("."), None, None);
     let mut snapshot: Option<String> = None;
+    let (mut no_agent, mut replan, mut model) = (false, false, None);
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -43,6 +49,9 @@ fn main() -> Result<()> {
             "-C" => dir = it.next().map(PathBuf::from).unwrap_or(dir),
             "--tour" => tour_file = it.next().map(PathBuf::from),
             "--snapshot" => snapshot = it.next(),
+            "--no-agent" => no_agent = true,
+            "--replan" => replan = true,
+            "--model" => model = it.next(),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -67,20 +76,73 @@ fn main() -> Result<()> {
         "manifest" if json => println!("{}", serde_json::to_string_pretty(&ws.manifest)?),
         "manifest" => print_text(&ws.manifest),
         "tour" => println!("{}", serde_json::to_string_pretty(&tour::auto(&ws))?),
+        "plan" => {
+            let cache = range
+                .head
+                .as_deref()
+                .and_then(|h| plan::cache_dir(&repo.root, &range.base, h));
+            let (_agent, rx) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
+            let t = plan::run_headless(&ws, rx, cache.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&t)?);
+        }
         _ if snapshot.is_some() => {
-            let tour = tour.unwrap_or_else(|| tour::auto(&ws));
             let keys = snapshot.unwrap_or_default();
-            print!("{}", app::App::new(&ws, tour).snapshot(&keys, 120, 40)?);
+            print!("{}", app::App::new(&ws, tour::auto(&ws), tour).snapshot(&keys, 120, 40)?);
         }
         _ => {
-            let tour = tour.unwrap_or_else(|| tour::auto(&ws));
+            let auto = tour::auto(&ws);
+            let cache = range
+                .head
+                .as_deref()
+                .and_then(|h| plan::cache_dir(&repo.root, &range.base, h));
+            let cached: Option<tour::Tour> = cache
+                .as_ref()
+                .filter(|_| !replan)
+                .and_then(|d| std::fs::read_to_string(d.join("tour.json")).ok())
+                .and_then(|j| serde_json::from_str(&j).ok());
+            let app = if tour.is_some() || no_agent {
+                app::App::new(&ws, auto, tour)
+            } else if cached.is_some() {
+                app::App::new(&ws, auto, cached)
+            } else {
+                let (a, rx) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
+                app::App::new(&ws, auto, None).with_agent(a, rx, true, cache.clone())
+            };
             let mut terminal = ratatui::init();
-            let res = app::App::new(&ws, tour).run(&mut terminal);
+            let res = app.run(&mut terminal);
             ratatui::restore();
             res?;
         }
     }
     Ok(())
+}
+
+fn start_planner(
+    repo: &git::Repo,
+    ws: &manifest::Workspace,
+    cache: Option<&std::path::Path>,
+    model: Option<&str>,
+) -> Result<(agent::Agent, std::sync::mpsc::Receiver<agent::Event>)> {
+    let session = agent::new_session_id();
+    if let Some(d) = cache {
+        std::fs::create_dir_all(d)?;
+        std::fs::write(d.join("session"), &session)?;
+    }
+    let log = cache.map(|d| d.join("agent.log"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut a = agent::Agent::start(
+        agent::Options {
+            cwd: &repo.root,
+            session: &session,
+            resume: false,
+            system: plan::SYSTEM,
+            model,
+            log: log.as_deref(),
+        },
+        tx,
+    )?;
+    a.send(&plan::prompt(ws))?;
+    Ok((a, rx))
 }
 
 fn clean(s: &str) -> String {

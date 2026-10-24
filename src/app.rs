@@ -1,4 +1,6 @@
+use crate::agent::{self, Agent};
 use crate::lens::{Lenses, Resolution};
+use crate::plan;
 use crate::manifest::Workspace;
 use crate::theme::*;
 use crate::tour::{Block, Tour};
@@ -11,11 +13,30 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Frame, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::{DefaultTerminal, Frame as Canvas};
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
+
+const AUTO: usize = 0;
+const AGENT: usize = 1;
+
+struct Planning {
+    parser: plan::Parser,
+    status: String,
+    error: Option<String>,
+    started: Instant,
+}
 
 pub struct App<'a> {
     ws: &'a Workspace,
-    tour: Tour,
+    tours: [Tour; 2],
+    current: usize,
+    agent: Option<Agent>,
+    events: Option<Receiver<agent::Event>>,
+    planning: Option<Planning>,
+    agent_ready: bool,
+    cache: Option<PathBuf>,
+    notice: Option<String>,
     lenses: Lenses,
     steps: Vec<(usize, usize)>,
     pos: usize,
@@ -31,18 +52,28 @@ pub struct App<'a> {
 }
 
 impl<'a> App<'a> {
-    pub fn new(ws: &'a Workspace, tour: Tour) -> App<'a> {
-        let steps: Vec<(usize, usize)> = tour
-            .stages
-            .iter()
-            .enumerate()
-            .flat_map(|(s, st)| (0..st.steps.len()).map(move |i| (s, i)))
-            .collect();
-        App {
+    pub fn new(ws: &'a Workspace, auto: Tour, agent: Option<Tour>) -> App<'a> {
+        let agent_ready = agent.is_some();
+        let current = if agent_ready { AGENT } else { AUTO };
+        let agent_tour = agent.unwrap_or_else(|| Tour {
+            title: auto.title.clone(),
+            intent: String::new(),
+            range: None,
+            glossary: Vec::new(),
+            stages: Vec::new(),
+        });
+        let mut app = App {
             ws,
-            tour,
+            tours: [auto, agent_tour],
+            current,
+            agent: None,
+            events: None,
+            planning: None,
+            agent_ready,
+            cache: None,
+            notice: None,
             lenses: Lenses::default(),
-            steps,
+            steps: Vec::new(),
             pos: 0,
             scroll: 0,
             visited: BTreeSet::from([0]),
@@ -53,13 +84,135 @@ impl<'a> App<'a> {
             content_len: 0,
             view_height: 0,
             quit: false,
+        };
+        app.refresh_steps();
+        app
+    }
+
+    pub fn with_agent(mut self, agent: Agent, events: Receiver<agent::Event>, planning: bool, cache: Option<PathBuf>) -> Self {
+        self.agent = Some(agent);
+        self.events = Some(events);
+        self.cache = cache;
+        if planning {
+            self.planning = Some(Planning {
+                parser: plan::Parser::default(),
+                status: "reading the change".into(),
+                error: None,
+                started: Instant::now(),
+            });
         }
+        self
+    }
+
+    fn tour(&self) -> &Tour {
+        &self.tours[self.current]
+    }
+
+    fn refresh_steps(&mut self) {
+        self.steps = self.tours[self.current]
+            .stages
+            .iter()
+            .enumerate()
+            .flat_map(|(s, st)| (0..st.steps.len()).map(move |i| (s, i)))
+            .collect();
+        self.pos = self.pos.min(self.steps.len().saturating_sub(1));
+    }
+
+    fn switch_tour(&mut self, to: usize) {
+        if to == self.current || (to == AGENT && self.tours[AGENT].stages.is_empty()) {
+            return;
+        }
+        self.current = to;
+        self.pos = 0;
+        self.scroll = 0;
+        self.focus = 0;
+        self.visited = BTreeSet::from([0]);
+        self.overrides.clear();
+        self.refresh_steps();
+    }
+
+    fn pump(&mut self) {
+        let Some(rx) = &self.events else { return };
+        let events: Vec<agent::Event> = rx.try_iter().collect();
+        for e in events {
+            self.on_event(e);
+        }
+    }
+
+    fn on_event(&mut self, e: agent::Event) {
+        let Some(p) = &mut self.planning else { return };
+        let parsed = match e {
+            agent::Event::Text(t) => p.parser.push(&t),
+            agent::Event::Tool(t) => {
+                p.status = t;
+                Vec::new()
+            }
+            agent::Event::TurnDone { ok } => {
+                let rest = p.parser.finish();
+                if !ok {
+                    p.error = Some("the agent reported an error".into());
+                }
+                self.apply(rest);
+                self.finish_planning();
+                return;
+            }
+            agent::Event::Exited(err) => {
+                p.error = Some(if err.is_empty() { "the agent stopped".into() } else { err });
+                self.agent = None;
+                return;
+            }
+        };
+        self.apply(parsed);
+    }
+
+    fn apply(&mut self, parsed: Vec<plan::Parsed>) {
+        for item in parsed {
+            match item {
+                plan::Parsed::Header { title, intent, glossary } => {
+                    let t = &mut self.tours[AGENT];
+                    t.title = title;
+                    t.intent = intent;
+                    t.glossary = glossary;
+                }
+                plan::Parsed::Stage(st) => {
+                    let first = self.tours[AGENT].stages.is_empty();
+                    self.tours[AGENT].stages.push(st);
+                    if first && self.current == AUTO && self.visited.len() <= 1 && self.pos == 0 {
+                        self.switch_tour(AGENT);
+                    } else if first && self.current == AUTO {
+                        self.notice = Some("The agent tour has started. Press A to switch.".into());
+                    }
+                    if self.current == AGENT {
+                        self.refresh_steps();
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_planning(&mut self) {
+        let Some(p) = self.planning.take() else { return };
+        if self.tours[AGENT].stages.is_empty() {
+            self.notice = Some(format!(
+                "The agent did not return a tour{}. This is the automatic tour.",
+                p.error.map(|e| format!(" ({e})")).unwrap_or_default()
+            ));
+            return;
+        }
+        plan::complete(&mut self.tours[AGENT], self.ws);
+        self.agent_ready = true;
+        if self.current == AGENT {
+            self.refresh_steps();
+        }
+        plan::save(&self.tours[AGENT], self.cache.as_deref());
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
+            self.pump();
             terminal.draw(|f| self.draw(f))?;
-            if event::poll(Duration::from_millis(250))?
+            let tick = if self.planning.is_some() { 80 } else { 250 };
+            if event::poll(Duration::from_millis(tick))?
                 && let Event::Key(k) = event::read()?
                 && k.kind == KeyEventKind::Press
             {
@@ -110,7 +263,7 @@ impl<'a> App<'a> {
 
     fn step_blocks(&self) -> &[Block] {
         match self.steps.get(self.pos) {
-            Some(&(s, i)) => &self.tour.stages[s].steps[i].blocks,
+            Some(&(s, i)) => &self.tour().stages[s].steps[i].blocks,
             None => &[],
         }
     }
@@ -175,6 +328,7 @@ impl<'a> App<'a> {
             self.help = false;
             return;
         }
+        self.notice = None;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let half = (self.view_height / 2).max(1) as isize;
         match k.code {
@@ -207,6 +361,7 @@ impl<'a> App<'a> {
             KeyCode::Char('-') | KeyCode::Char('_') => self.zoom(false),
             KeyCode::Char('d') => self.toggle_diff(),
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('A') => self.switch_tour(if self.current == AUTO { AGENT } else { AUTO }),
             _ => {}
         }
     }
@@ -242,7 +397,7 @@ impl<'a> App<'a> {
         let left = vec![
             Span::styled(" cicerone ", Style::default().fg(BASE).bg(MAUVE).add_modifier(Modifier::BOLD)),
             Span::raw(" "),
-            Span::styled(self.tour.title.clone(), text().add_modifier(Modifier::BOLD)),
+            Span::styled(self.tour().title.clone(), text().add_modifier(Modifier::BOLD)),
         ];
         let rw: usize = right.iter().map(Span::width).sum();
         f.render_widget(Paragraph::new(Line::from(left)).style(Style::default().bg(MANTLE)), area);
@@ -258,7 +413,7 @@ impl<'a> App<'a> {
         let cur = self.steps.get(self.pos).copied().unwrap_or((0, 0));
         let mut lines: Vec<Line> = Vec::new();
         let mut cur_line = 0;
-        for (si, st) in self.tour.stages.iter().enumerate() {
+        for (si, st) in self.tour().stages.iter().enumerate() {
             let positions: Vec<usize> = (0..self.steps.len()).filter(|&p| self.steps[p].0 == si).collect();
             let all_seen = positions.iter().all(|p| self.visited.contains(p));
             let (mark, style) = if si == cur.0 {
@@ -268,9 +423,15 @@ impl<'a> App<'a> {
             } else {
                 ("○", dim())
             };
+            let max = (area.width as usize).saturating_sub(5);
+            let title = if st.title.chars().count() > max {
+                format!("{}…", st.title.chars().take(max.saturating_sub(1)).collect::<String>())
+            } else {
+                st.title.clone()
+            };
             lines.push(Line::from(vec![
                 Span::styled(format!(" {mark} "), style),
-                Span::styled(st.title.clone(), if si == cur.0 { style } else { text() }),
+                Span::styled(title, if si == cur.0 { style } else { text() }),
             ]));
             if si == cur.0 {
                 for (i, step) in st.steps.iter().enumerate() {
@@ -292,6 +453,8 @@ impl<'a> App<'a> {
                 }
             }
         }
+        lines.push(Line::default());
+        lines.extend(self.agent_lines(area.width as usize));
         let inner_h = area.height.saturating_sub(2) as usize;
         let off = cur_line.saturating_sub(inner_h.saturating_sub(3));
         let block = Frame::default()
@@ -301,20 +464,55 @@ impl<'a> App<'a> {
         f.render_widget(Paragraph::new(lines).block(block).scroll((off as u16, 0)), area);
     }
 
+    fn agent_lines(&self, w: usize) -> Vec<Line<'static>> {
+        let which = if self.current == AGENT { "agent tour" } else { "automatic tour" };
+        let mut out = vec![Line::from(vec![
+            Span::styled(" ✦ ", Style::default().fg(PEACH)),
+            Span::styled(which, Style::default().fg(SUBTEXT)),
+        ])];
+        if let Some(p) = &self.planning {
+            const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let i = (p.started.elapsed().as_millis() / 80) as usize % SPIN.len();
+            let status: String = p.status.chars().take(w.saturating_sub(6)).collect();
+            out.push(Line::from(vec![
+                Span::styled(format!(" {} ", SPIN[i]), Style::default().fg(MAUVE)),
+                Span::styled(
+                    format!("planning · {}s", p.started.elapsed().as_secs()),
+                    Style::default().fg(MAUVE),
+                ),
+            ]));
+            out.push(Line::from(Span::styled(format!("   {status}"), dim())));
+            if let Some(e) = &p.error {
+                out.push(Line::from(Span::styled(format!("   {e}"), Style::default().fg(RED))));
+            }
+        } else if self.agent_ready {
+            out.push(Line::from(Span::styled("   A switches tours", dim())));
+        }
+        out
+    }
+
     fn content(&mut self, w: usize) -> Vec<Line<'static>> {
         let Some(&(si, i)) = self.steps.get(self.pos) else {
             return vec![Line::from("This change has nothing to review.")];
         };
-        let stage = &self.tour.stages[si];
+        let stage = &self.tour().stages[si];
         let step = &stage.steps[i];
-        let mut out: Vec<Line<'static>> = vec![
+        let mut out: Vec<Line<'static>> = Vec::new();
+        if let Some(n) = &self.notice {
+            out.push(Line::from(vec![
+                Span::styled("✦ ", Style::default().fg(PEACH)),
+                Span::styled(n.clone(), Style::default().fg(PEACH)),
+            ]));
+            out.push(Line::default());
+        }
+        out.extend([
             Line::from(Span::styled(
                 format!("STAGE {} · {}", si + 1, stage.title.to_uppercase()),
                 Style::default().fg(OVERLAY).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(step.title.clone(), Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD))),
             Line::default(),
-        ];
+        ]);
         if !step.text.is_empty() {
             out.extend(view::markdown(&step.text, w));
             out.push(Line::default());
@@ -326,7 +524,7 @@ impl<'a> App<'a> {
             match b {
                 Block::Text(t) => out.extend(view::markdown(t, w)),
                 Block::Map => out.extend(view::map(self.ws, w)),
-                Block::Glossary => out.extend(view::glossary(self.ws, &self.tour, w)),
+                Block::Glossary => out.extend(view::glossary(self.ws, &self.tours[self.current], w)),
                 Block::Pattern(id) => out.extend(view::pattern(self.ws, id, w)),
                 Block::Mechanical => out.extend(view::mechanical(self.ws, w)),
                 Block::Lens(spec) => {
@@ -376,6 +574,7 @@ impl<'a> App<'a> {
             ("tab", "lens"),
             ("+/-", "zoom"),
             ("d", "diff"),
+            ("A", "tour"),
             ("?", "help"),
             ("q", "quit"),
         ];
@@ -399,6 +598,7 @@ fn draw_help(f: &mut Canvas, area: Rect) {
         ("tab  shift-tab", "focus next / previous lens"),
         ("+  -", "zoom the lens: name, signature, skeleton, full"),
         ("d", "show or hide removed lines and markers"),
+        ("A", "switch between the agent tour and the automatic tour"),
         ("q  esc", "quit"),
     ];
     let lines: Vec<Line> = rows
