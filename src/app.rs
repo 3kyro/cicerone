@@ -84,6 +84,7 @@ pub struct App<'a> {
     main_area: Rect,
     chat_page: usize,
     chat_max: usize,
+    mouse: bool,
     quit: bool,
 }
 
@@ -135,6 +136,7 @@ impl<'a> App<'a> {
             main_area: Rect::default(),
             chat_page: 1,
             chat_max: 0,
+            mouse: true,
             quit: false,
         };
         app.refresh_steps();
@@ -787,9 +789,32 @@ impl<'a> App<'a> {
         self.chat.scroll = (self.chat.scroll as isize + d).clamp(0, self.chat_max as isize) as usize;
     }
 
+    fn copy_last_answer(&mut self) {
+        let last = self.chat.msgs.iter().rev().find(|m| m.role == Role::Agent);
+        self.chat.flash = Some(match last {
+            Some(m) => match chat::copy_to_clipboard(m.text.trim()) {
+                Ok(()) => format!("copied {} characters", m.text.trim().chars().count()),
+                Err(e) => format!("copy failed: {e}"),
+            },
+            None => "nothing to copy yet".into(),
+        });
+    }
+
+    fn toggle_mouse(&mut self) {
+        use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+        self.mouse = !self.mouse;
+        let _ = if self.mouse {
+            ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+        } else {
+            ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture)
+        };
+    }
+
     fn chat_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        self.chat.flash = None;
         match k.code {
+            KeyCode::Char('y') if ctrl => self.copy_last_answer(),
             KeyCode::Esc => self.chat.open = false,
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('u') if ctrl => self.chat.input.clear(),
@@ -895,6 +920,7 @@ impl<'a> App<'a> {
             KeyCode::Char('-') | KeyCode::Char('_') => self.zoom(false),
             KeyCode::Char('d') => self.toggle_diff(),
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('m') => self.toggle_mouse(),
             KeyCode::Char('A') => self.switch_tour(if self.current == AUTO { AGENT } else { AUTO }),
             _ => {}
         }
@@ -1161,7 +1187,11 @@ impl<'a> App<'a> {
 
     fn draw_chat(&mut self, f: &mut Canvas, area: Rect) {
         self.chat_area = area;
-        let busy = if self.chat.busy { " · answering" } else { "" };
+        let busy = match (&self.chat.flash, self.chat.busy) {
+            (Some(f), _) => format!(" · {f}"),
+            (None, true) => " · answering".into(),
+            (None, false) => String::new(),
+        };
         let block = Frame::default()
             .borders(Borders::TOP)
             .border_type(BorderType::Rounded)
@@ -1206,6 +1236,7 @@ impl<'a> App<'a> {
                 ("enter", "send"),
                 ("esc", "close"),
                 ("↑/↓ pgup/pgdn wheel", "scroll"),
+                ("ctrl-y", "copy answer"),
                 ("ctrl-u", "clear"),
             ];
             let mut spans = vec![Span::raw(" ")];
@@ -1228,6 +1259,7 @@ impl<'a> App<'a> {
             ("c", "chat"),
             ("a", "ask"),
             ("A", "tour"),
+            ("m", if self.mouse { "mouse" } else { "mouse off" }),
             ("?", "help"),
             ("q", "quit"),
         ];
@@ -1256,6 +1288,8 @@ fn draw_help(f: &mut Canvas, area: Rect) {
         ("d", "show or hide removed lines and markers"),
         ("A", "switch between the agent tour and the automatic tour"),
         ("c", "open the chat with the agent"),
+        ("ctrl-y", "in the chat: copy the last answer to the clipboard"),
+        ("m", "mouse capture off (select text) / on (wheel scroll)"),
         ("a", "ask about the focused lens"),
         ("esc", "close the chat or this help"),
         ("q", "quit"),

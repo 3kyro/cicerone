@@ -72,6 +72,8 @@ pub struct Chat {
     /// Lines scrolled up from the bottom of the transcript.
     pub scroll: usize,
     pub about: Option<(String, String)>,
+    /// A short confirmation for the title bar, cleared on the next key.
+    pub flash: Option<String>,
 }
 
 impl Chat {
@@ -214,6 +216,30 @@ impl Chat {
     }
 }
 
+/// Puts `text` on the system clipboard through the terminal (OSC 52).
+pub fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()))?;
+    out.flush()
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +258,15 @@ mod tests {
         };
         assert_eq!(render("abcdefgh", 6), vec!["› abc", "  def", "  gh▍"]);
         assert_eq!(render("why does it log", 10), vec!["› why ", "  does ", "  it log▍"]);
+    }
+
+    #[test]
+    fn base64_matches_the_standard_alphabet() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64("ü✦".as_bytes()), "w7zinKY=");
     }
 
     #[test]
