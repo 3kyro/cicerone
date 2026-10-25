@@ -6,15 +6,12 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A running Claude Code session, from `$CLAUDE_CODE_MESSAGING_SOCKET` or the
-/// `~/.claude/sessions/` registry.
+/// A running Claude Code session.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub name: String,
-    cwd: PathBuf,
     socket: PathBuf,
     token: Option<String>,
-    updated_at: u64,
 }
 
 fn sessions_dir() -> Option<PathBuf> {
@@ -24,10 +21,8 @@ fn sessions_dir() -> Option<PathBuf> {
 fn parse_session(v: &Value) -> Option<Session> {
     Some(Session {
         name: v["name"].as_str().unwrap_or("claude").to_string(),
-        cwd: PathBuf::from(v["cwd"].as_str().unwrap_or("")),
         socket: PathBuf::from(v["messagingSocketPath"].as_str()?),
         token: None,
-        updated_at: v["updatedAt"].as_u64().unwrap_or(0),
     })
 }
 
@@ -74,34 +69,27 @@ fn registry_sessions(dir: &Path) -> Vec<Session> {
     sessions
 }
 
-/// The session that opened cicerone, else the most recent live session
-/// running inside `root`.
-pub fn discover(root: &Path) -> Option<Session> {
+/// The session that opened cicerone, from `$CLAUDE_CODE_MESSAGING_SOCKET`.
+/// Other live sessions are never picked: only the one that launched this
+/// tab asked for cicerone's output.
+pub fn opener() -> Option<Session> {
+    let socket = PathBuf::from(std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET")?);
     let registry = sessions_dir().as_deref().map(registry_sessions).unwrap_or_default();
-    if let Some(socket) = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET") {
-        let socket = PathBuf::from(socket);
-        let entry = registry.into_iter().find(|s| s.socket == socket);
-        // the registry key is the peer token, valid for non-child senders;
-        // the env token only works where child process evidence does
-        let token = entry.as_ref().and_then(|s| s.token.clone()).or_else(|| {
-            std::env::var("CLAUDE_CODE_MESSAGING_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-        });
-        let mut s = entry.unwrap_or_else(|| Session {
-            name: "claude".into(),
-            cwd: root.to_path_buf(),
-            socket,
-            token: None,
-            updated_at: 0,
-        });
-        s.token = token;
-        return Some(s);
-    }
-    registry
-        .into_iter()
-        .filter(|s| s.cwd.starts_with(root) && UnixStream::connect(&s.socket).is_ok())
-        .max_by_key(|s| s.updated_at)
+    let entry = registry.into_iter().find(|s| s.socket == socket);
+    // the registry key is the peer token, valid for non-child senders;
+    // the env token only works where child process evidence does
+    let token = entry.as_ref().and_then(|s| s.token.clone()).or_else(|| {
+        std::env::var("CLAUDE_CODE_MESSAGING_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+    });
+    let mut s = entry.unwrap_or(Session {
+        name: "claude".into(),
+        socket,
+        token: None,
+    });
+    s.token = token;
+    Some(s)
 }
 
 /// Newline-delimited JSON over the session's inbox socket: an auth frame

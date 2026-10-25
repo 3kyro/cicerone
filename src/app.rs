@@ -386,9 +386,8 @@ impl<'a> App<'a> {
         let _ = chat::copy_to_clipboard(&path.display().to_string());
         let root = self.config.as_ref().map(|c| c.root.clone()).unwrap_or_default();
         let range = format!("{}..{}", self.ws.manifest.base, self.ws.manifest.head);
-        let title = self.tours[self.current].title.clone();
-        let sent = session::discover(&root).map(|s| {
-            let r = session::send(&s, &report::publish_message(&path, &root, &range, &title));
+        let sent = session::opener().map(|s| {
+            let r = session::send(&s, &report::publish_message(&path, &root, &range));
             (s.name, r)
         });
         self.notice = Some(match sent {
@@ -401,7 +400,7 @@ impl<'a> App<'a> {
                 path.display()
             ),
             None => format!(
-                "Report saved to {} (path copied). No Claude session to publish it: open cicerone with /cicerone, or give the path to any agent.",
+                "Report saved to {} (path copied). cicerone was not opened from a Claude session, so nothing publishes it: open it with /cicerone, or give the path to any agent.",
                 path.display()
             ),
         });
