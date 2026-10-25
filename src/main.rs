@@ -110,7 +110,7 @@ fn main() -> Result<()> {
                 .head
                 .as_deref()
                 .and_then(|h| plan::cache_dir(&repo.root, &range.base, h));
-            let findings = review::load(cache.as_deref()).unwrap_or_default();
+            let findings = review::load(cache.as_deref(), &ws).unwrap_or_default();
             let app = app::App::new(&ws, tour::auto(&ws), tour)
                 .with_config(None, cache.clone())
                 .with_findings(findings);
@@ -140,7 +140,7 @@ fn main() -> Result<()> {
                 model: model.clone(),
                 session: session.filter(|_| tour.is_none()),
             });
-            let findings = review::load(cache.as_deref());
+            let findings = review::load(cache.as_deref(), &ws);
             let app = if tour.is_some() || no_agent || cached.is_some() {
                 let resumable = cached.is_some() && config.is_some();
                 let app = app::App::new(&ws, auto, tour.or(cached)).with_config(config, cache.clone());

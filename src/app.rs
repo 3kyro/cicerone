@@ -273,10 +273,18 @@ impl<'a> App<'a> {
                 Some(plan::Parsed::Update(u)) => {
                     let id = u.id.clone();
                     let reason = u.reason.clone();
+                    let ws = self.ws;
                     self.findings
                         .iter_mut()
                         .find(|f| f.id == id)
-                        .and_then(|f| f.revise(u))
+                        .and_then(|f| {
+                            let before = f.lines;
+                            let what = f.revise(u)?;
+                            if !review::clamp(f, ws) {
+                                f.lines = before;
+                            }
+                            Some(what)
+                        })
                         .map(|what| format!("{id} {what}: {reason}"))
                 }
                 Some(plan::Parsed::Withdraw(w)) => self

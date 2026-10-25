@@ -149,20 +149,36 @@ Answer with JSON Lines only, one line per finding, each as soon as you have it:
 /// Keeps a finding only when it points into a changed file at lines that
 /// exist, and gives it an id.
 pub fn accept(mut f: Finding, ws: &Workspace, n: usize) -> Option<Finding> {
-    let file = ws.file(&f.file)?;
-    let len = file.head.as_deref().or(file.base.as_deref())?.lines().count().max(1);
-    let (a, b) = (f.lines.0.min(f.lines.1).max(1), f.lines.0.max(f.lines.1).max(1));
-    if a > len {
+    if !clamp(&mut f, ws) {
         return None;
     }
-    f.lines = (a, b.min(len));
     f.id = format!("F{n}");
     Some(f)
 }
 
-pub fn load(cache: Option<&Path>) -> Option<Vec<Finding>> {
+/// Orders the lines of `f` and keeps them inside its file. False when the
+/// file is not in the change or the lines start past its end.
+pub fn clamp(f: &mut Finding, ws: &Workspace) -> bool {
+    let Some(len) = ws
+        .file(&f.file)
+        .and_then(|file| file.head.as_deref().or(file.base.as_deref()))
+        .map(|src| src.lines().count().max(1))
+    else {
+        return false;
+    };
+    let (a, b) = (f.lines.0.min(f.lines.1).max(1), f.lines.0.max(f.lines.1).max(1));
+    if a > len {
+        return false;
+    }
+    f.lines = (a, b.min(len));
+    true
+}
+
+pub fn load(cache: Option<&Path>, ws: &Workspace) -> Option<Vec<Finding>> {
     let j = std::fs::read_to_string(cache?.join("review.json")).ok()?;
-    serde_json::from_str(&j).ok()
+    let mut fs: Vec<Finding> = serde_json::from_str(&j).ok()?;
+    fs.retain_mut(|f| clamp(f, ws));
+    Some(fs)
 }
 
 pub fn save(findings: &[Finding], cache: Option<&Path>) {
@@ -193,7 +209,7 @@ pub fn sync_stage(tour: &mut Tour, findings: &[Finding]) {
                     Block::Finding(f.id.clone()),
                     Block::Lens(LensSpec {
                         focus: vec![f.lines],
-                        ..LensSpec::lines(&f.file, f.lines.0.saturating_sub(CONTEXT).max(1), f.lines.1 + CONTEXT)
+                        ..LensSpec::lines(&f.file, f.lines.0.saturating_sub(CONTEXT).max(1), f.lines.1.saturating_add(CONTEXT))
                     }),
                 ],
             })
@@ -273,6 +289,9 @@ mod tests {
         assert_eq!((f.id.as_str(), f.lines), ("F1", (3, 4)));
         assert!(accept(finding(Severity::Bug, "B.hs", (1, 1)), &ws, 2).is_none());
         assert!(accept(finding(Severity::Bug, "A.hs", (7, 8)), &ws, 3).is_none());
+        let mut huge = finding(Severity::Bug, "A.hs", (2, usize::MAX));
+        assert!(clamp(&mut huge, &ws));
+        assert_eq!(huge.lines, (2, 4));
     }
 
     #[test]
