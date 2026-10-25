@@ -40,7 +40,12 @@ COVERAGE
 After the plan, cicerone can send the hunks that the tour does not show yet. Answer with JSON Lines only: one or more {"stage":{...}} lines whose steps sort those hunks into "group" blocks by what they do. Each listed hunk goes into exactly one group. Use lenses only for a hunk that a reviewer must read in full.
 
 CHAT
-After the plan, the reviewer can send questions. Each question names the step and the lens they are looking at. Answer in short markdown for a terminal: plain sentences, `code`, bullets. No headings, no tables, no JSON."#;
+After the plan, the reviewer can send questions. Each question names the step and the lens they are looking at, and lists the open review findings with their ids (F1, F2, ...). Answer in short markdown for a terminal: plain sentences, `code`, bullets. No headings, no tables.
+When the conversation shows that a finding is wrong, too severe, too mild, or needs a better text or anchor, change it: put one JSON object on its own line, anywhere in the answer:
+{"finding_update":{"id":"F3","severity":"nit","title":"...","body":"...","lines":[a,b],"reason":"why it changed"}} (give only the fields that change, and always a reason)
+{"finding_withdraw":{"id":"F3","reason":"why it is not a problem"}}
+{"finding":{...}} for a new problem, in the review format.
+Do this only when the evidence supports it, and say so in the text too. Never put other JSON in an answer."#;
 
 const MAX_DIFF: usize = 400_000;
 
@@ -111,11 +116,13 @@ struct Header {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum Item {
     Tour(Header),
     Stage(Stage),
     Finding(crate::review::Finding),
+    FindingUpdate(crate::review::Update),
+    FindingWithdraw(crate::review::Withdraw),
 }
 
 #[derive(Default)]
@@ -127,6 +134,8 @@ pub enum Parsed {
     Header { title: String, intent: String, glossary: Vec<Gloss> },
     Stage(Stage),
     Finding(crate::review::Finding),
+    Update(crate::review::Update),
+    Withdraw(crate::review::Withdraw),
 }
 
 impl Parser {
@@ -146,7 +155,7 @@ impl Parser {
     }
 }
 
-fn parse_line(line: &str) -> Option<Parsed> {
+pub fn parse_line(line: &str) -> Option<Parsed> {
     let line = line.trim();
     if !line.starts_with('{') {
         return None;
@@ -159,6 +168,8 @@ fn parse_line(line: &str) -> Option<Parsed> {
         }),
         Item::Stage(s) => Some(Parsed::Stage(s)),
         Item::Finding(f) => Some(Parsed::Finding(f)),
+        Item::FindingUpdate(u) => Some(Parsed::Update(u)),
+        Item::FindingWithdraw(w) => Some(Parsed::Withdraw(w)),
     }
 }
 
@@ -322,6 +333,7 @@ pub fn run_headless(
                     eprintln!("stage: {}", crate::clean(&s.title));
                     tour.stages.push(s);
                 }
+                Parsed::Update(_) | Parsed::Withdraw(_) => {}
                 Parsed::Finding(f) => {
                     if let Some(f) = review::accept(f, ws, findings.len() + 1) {
                         eprintln!("finding: {} {}", f.severity.label(), crate::clean(&f.title));
@@ -397,5 +409,9 @@ mod tests {
         let mut p = Parser::default();
         let got = p.push("{\"finding\":{\"severity\":\"risk\",\"title\":\"T\",\"file\":\"A.hs\",\"lines\":[3,5]}}\n");
         assert!(matches!(&got[0], Parsed::Finding(f) if f.lines == (3, 5) && f.severity == crate::review::Severity::Risk));
+        let u = parse_line("{\"finding_update\":{\"id\":\"F3\",\"severity\":\"nit\",\"reason\":\"r\"}}");
+        assert!(matches!(u, Some(Parsed::Update(u)) if u.id == "F3" && u.severity == Some(crate::review::Severity::Nit)));
+        let w = parse_line("{\"finding_withdraw\":{\"id\":\"F3\",\"reason\":\"r\"}}");
+        assert!(matches!(w, Some(Parsed::Withdraw(w)) if w.id == "F3"));
     }
 }

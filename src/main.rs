@@ -111,7 +111,9 @@ fn main() -> Result<()> {
                 .as_deref()
                 .and_then(|h| plan::cache_dir(&repo.root, &range.base, h));
             let findings = review::load(cache.as_deref()).unwrap_or_default();
-            let app = app::App::new(&ws, tour::auto(&ws), tour).with_findings(findings);
+            let app = app::App::new(&ws, tour::auto(&ws), tour)
+                .with_config(None, cache.clone())
+                .with_findings(findings);
             print!("{}", app.snapshot(&keys, 120, 40)?);
         }
         _ => {
@@ -158,7 +160,9 @@ fn main() -> Result<()> {
                     .planning_with(a, rx)
             };
             let mut terminal = ratatui::init();
+            let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture);
             let res = app.run(&mut terminal);
+            let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::DisableMouseCapture);
             ratatui::restore();
             res?;
         }

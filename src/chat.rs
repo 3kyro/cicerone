@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum Role {
     User,
     Agent,
+    Event,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +18,46 @@ pub struct Msg {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
+}
+
+/// Takes the finding updates out of streamed answer text. A line that may
+/// still turn into one is held back until it ends.
+#[derive(Default)]
+pub struct Filter {
+    held: String,
+}
+
+const MARK: &str = "{\"finding";
+
+impl Filter {
+    pub fn push(&mut self, text: &str) -> (String, Vec<String>) {
+        self.held.push_str(text);
+        let mut shown = String::new();
+        let mut items = Vec::new();
+        while let Some(i) = self.held.find('\n') {
+            let line: String = self.held.drain(..=i).collect();
+            if line.trim_start().starts_with(MARK) {
+                items.push(line.trim().to_string());
+            } else {
+                shown.push_str(&line);
+            }
+        }
+        let rest = self.held.trim_start();
+        let held_back = rest.starts_with('{') && (MARK.starts_with(rest) || rest.starts_with(MARK));
+        if !held_back {
+            shown.push_str(&std::mem::take(&mut self.held));
+        }
+        (shown, items)
+    }
+
+    pub fn finish(&mut self) -> (String, Vec<String>) {
+        let rest = std::mem::take(&mut self.held);
+        if rest.trim_start().starts_with(MARK) {
+            (String::new(), vec![rest.trim().to_string()])
+        } else {
+            (rest, Vec::new())
+        }
+    }
 }
 
 #[derive(Default)]
@@ -53,6 +94,14 @@ impl Chat {
         }
     }
 
+    pub fn push_event(&mut self, t: String) {
+        self.msgs.push(Msg {
+            role: Role::Event,
+            text: t,
+            about: None,
+        });
+    }
+
     pub fn push_text(&mut self, t: &str) {
         match self.msgs.last_mut() {
             Some(m) if m.role == Role::Agent => m.text.push_str(t),
@@ -84,6 +133,12 @@ impl Chat {
                         }));
                         out.push(Line::from(spans));
                     }
+                }
+                Role::Event => {
+                    out.push(Line::from(Span::styled(
+                        format!("↻ {}", m.text),
+                        Style::default().fg(PEACH).add_modifier(Modifier::ITALIC),
+                    )));
                 }
                 Role::Agent => {
                     for (i, l) in view::markdown(&m.text, w.saturating_sub(2)).into_iter().enumerate() {
@@ -124,5 +179,24 @@ impl Chat {
             spans.push(Span::styled("▍", Style::default().fg(MAUVE)));
         }
         Line::from(spans)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_takes_out_update_lines_across_chunks() {
+        let mut f = Filter::default();
+        let (a, i1) = f.push("I agree.\n{\"finding_up");
+        let (b, i2) = f.push("date\":{\"id\":\"F1\"}}\nSo it is a nit.");
+        let (c, i3) = f.finish();
+        assert_eq!(format!("{a}{b}{c}"), "I agree.\nSo it is a nit.");
+        assert!(i1.is_empty());
+        assert_eq!(i2, vec!["{\"finding_update\":{\"id\":\"F1\"}}"]);
+        assert!(i3.is_empty());
+        let (d, _) = f.push("{x} is code\n");
+        assert_eq!(d, "{x} is code\n");
     }
 }

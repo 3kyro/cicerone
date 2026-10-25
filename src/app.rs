@@ -1,5 +1,5 @@
 use crate::agent::{self, Agent};
-use crate::chat::{Chat, Msg, Role};
+use crate::chat::{self, Chat, Msg, Role};
 use crate::lens::{Lenses, Resolution};
 use crate::plan;
 use crate::review;
@@ -8,7 +8,9 @@ use crate::theme::*;
 use crate::tour::{Block, Tour};
 use crate::view;
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -48,6 +50,7 @@ pub struct App<'a> {
     ws: &'a Workspace,
     findings: Vec<review::Finding>,
     step_findings: Vec<Vec<usize>>,
+    chat_filter: chat::Filter,
     chat: Chat,
     config: Option<AgentConfig>,
     needs_primer: bool,
@@ -76,6 +79,10 @@ pub struct App<'a> {
     view_width: usize,
     hscroll: usize,
     hmax: usize,
+    chat_area: Rect,
+    main_area: Rect,
+    chat_page: usize,
+    chat_max: usize,
     quit: bool,
 }
 
@@ -94,6 +101,7 @@ impl<'a> App<'a> {
             ws,
             findings: Vec::new(),
             step_findings: Vec::new(),
+            chat_filter: chat::Filter::default(),
             chat: Chat::default(),
             config: None,
             needs_primer: false,
@@ -122,6 +130,10 @@ impl<'a> App<'a> {
             view_width: 0,
             hscroll: 0,
             hmax: 0,
+            chat_area: Rect::default(),
+            main_area: Rect::default(),
+            chat_page: 1,
+            chat_max: 0,
             quit: false,
         };
         app.refresh_steps();
@@ -204,7 +216,16 @@ impl<'a> App<'a> {
             ctx = format!("The reviewer is at stage \"{}\", step \"{}\".", st.title, st.steps[i].title);
         }
         if let Some((_, lens)) = about {
-            ctx.push_str(&format!(" They ask about this lens: {lens}."));
+            ctx.push_str(&format!(" They ask about {lens}."));
+        }
+        let open: Vec<String> = self
+            .findings
+            .iter()
+            .filter(|f| !f.withdrawn)
+            .map(|f| format!("{} [{}] {}", f.id, f.severity.label(), f.title))
+            .collect();
+        if !open.is_empty() {
+            ctx.push_str(&format!("\nOpen review findings: {}.\n{}", open.join("; "), review::UPDATE_RULES));
         }
         let message = format!("{ctx}\n\nQuestion: {q}");
         if self.planning.is_some() {
@@ -242,14 +263,57 @@ impl<'a> App<'a> {
         }
     }
 
+    fn chat_output(&mut self, shown: String, items: Vec<String>) {
+        if !shown.is_empty() {
+            self.chat.push_text(&shown);
+        }
+        let mut changed = false;
+        for line in items {
+            let event = match plan::parse_line(&line) {
+                Some(plan::Parsed::Update(u)) => {
+                    let id = u.id.clone();
+                    let reason = u.reason.clone();
+                    self.findings
+                        .iter_mut()
+                        .find(|f| f.id == id)
+                        .and_then(|f| f.revise(u))
+                        .map(|what| format!("{id} {what}: {reason}"))
+                }
+                Some(plan::Parsed::Withdraw(w)) => self
+                    .findings
+                    .iter_mut()
+                    .find(|f| f.id == w.id)
+                    .and_then(|f| f.withdraw(&w.reason).then(|| format!("{} withdrawn: {}", w.id, w.reason))),
+                Some(plan::Parsed::Finding(f)) => review::accept(f, self.ws, self.findings.len() + 1).map(|f| {
+                    let e = format!("{} new {}: {}", f.id, f.severity.label(), f.title);
+                    self.findings.push(f);
+                    e
+                }),
+                None => Some(format!("could not read a finding change: {}", crate::clean(&line))),
+                _ => None,
+            };
+            if let Some(e) = event {
+                self.chat.push_event(e);
+                changed = true;
+            }
+        }
+        if changed {
+            self.sync_findings();
+        }
+    }
+
     fn on_chat_event(&mut self, e: agent::Event) {
         match e {
             agent::Event::Text(t) => {
                 self.turn_text = true;
-                self.chat.push_text(&t);
+                let (shown, items) = self.chat_filter.push(&t);
+                self.chat_output(shown, items);
             }
             agent::Event::Tool(t) => self.chat.status = t,
             agent::Event::TurnDone { ok } => {
+                let (shown, items) = self.chat_filter.finish();
+                self.chat_output(shown, items);
+                review::save(&self.findings, self.cache.as_deref());
                 self.chat.busy = false;
                 self.resuming = false;
                 if !ok {
@@ -345,7 +409,7 @@ impl<'a> App<'a> {
                         if explicit.contains(&f.id.as_str()) {
                             return true;
                         }
-                        if is_review || placed[k] || !rs.iter().any(|(file, a, b)| f.hits(file, *a, *b)) {
+                        if is_review || f.withdrawn || placed[k] || !rs.iter().any(|(file, a, b)| f.hits(file, *a, *b)) {
                             return false;
                         }
                         placed[k] = true;
@@ -548,6 +612,7 @@ impl<'a> App<'a> {
                         self.sync_findings();
                     }
                 }
+                plan::Parsed::Update(_) | plan::Parsed::Withdraw(_) => {}
             }
         }
     }
@@ -574,11 +639,12 @@ impl<'a> App<'a> {
             self.pump();
             terminal.draw(|f| self.draw(f))?;
             let tick = if self.planning.is_some() { 80 } else { 250 };
-            if event::poll(Duration::from_millis(tick))?
-                && let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press
-            {
-                self.key(k);
+            if event::poll(Duration::from_millis(tick))? {
+                match event::read()? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => self.key(k),
+                    Event::Mouse(m) => self.mouse(m),
+                    _ => {}
+                }
             }
         }
         Ok(())
@@ -598,6 +664,7 @@ impl<'a> App<'a> {
                     "down" => KeyCode::Down,
                     "up" => KeyCode::Up,
                     "pgdn" => KeyCode::PageDown,
+                    "pgup" => KeyCode::PageUp,
                     "right" => KeyCode::Right,
                     "enter" => KeyCode::Enter,
                     "esc" => KeyCode::Esc,
@@ -693,6 +760,24 @@ impl<'a> App<'a> {
         self.scroll = (self.scroll as isize + d).clamp(0, max as isize) as usize;
     }
 
+    fn mouse(&mut self, m: MouseEvent) {
+        let up = match m.kind {
+            MouseEventKind::ScrollUp => true,
+            MouseEventKind::ScrollDown => false,
+            _ => return,
+        };
+        let at = ratatui::layout::Position::new(m.column, m.row);
+        if self.chat.open && self.chat_area.contains(at) {
+            self.chat_scroll_by(if up { 3 } else { -3 });
+        } else if self.main_area.contains(at) {
+            self.scroll_by(if up { -3 } else { 3 });
+        }
+    }
+
+    fn chat_scroll_by(&mut self, d: isize) {
+        self.chat.scroll = (self.chat.scroll as isize + d).clamp(0, self.chat_max as isize) as usize;
+    }
+
     fn chat_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
@@ -708,8 +793,12 @@ impl<'a> App<'a> {
             KeyCode::Backspace => {
                 self.chat.input.pop();
             }
-            KeyCode::PageUp => self.chat.scroll += 5,
-            KeyCode::PageDown => self.chat.scroll = self.chat.scroll.saturating_sub(5),
+            KeyCode::Up => self.chat_scroll_by(1),
+            KeyCode::Down => self.chat_scroll_by(-1),
+            KeyCode::PageUp => self.chat_scroll_by(self.chat_page as isize),
+            KeyCode::PageDown => self.chat_scroll_by(-(self.chat_page as isize)),
+            KeyCode::Char('b') if ctrl => self.chat_scroll_by(self.chat_page as isize),
+            KeyCode::Char('f') if ctrl => self.chat_scroll_by(-(self.chat_page as isize)),
             KeyCode::Char(c) if !ctrl => self.chat.input.push(c),
             _ => {}
         }
@@ -718,6 +807,17 @@ impl<'a> App<'a> {
     fn open_chat(&mut self, about_lens: bool) {
         self.chat.open = true;
         self.chat.about = None;
+        let finding = self.step_blocks().iter().find_map(|b| match b {
+            Block::Finding(id) => self.findings.iter().find(|f| &f.id == id).cloned(),
+            _ => None,
+        });
+        if about_lens && let Some(f) = finding {
+            self.chat.about = Some((
+                format!("{} · {}", f.id, f.title),
+                format!("review finding {} ({} at {}:{}-{})", f.id, f.title, f.file, f.lines.0, f.lines.1),
+            ));
+            return;
+        }
         if about_lens && let Some(spec) = self.focused_spec() {
             let (res, diff) = self
                 .overrides
@@ -857,8 +957,9 @@ impl<'a> App<'a> {
             };
             let count: usize = positions
                 .iter()
-                .map(|&p| self.step_findings.get(p).map_or(0, Vec::len))
-                .sum();
+                .flat_map(|&p| self.step_findings.get(p).into_iter().flatten())
+                .filter(|&&k| !self.findings[k].withdrawn)
+                .count();
             let badge = if count > 0 { format!(" ◆{count}") } else { String::new() };
             let max = (area.width as usize).saturating_sub(5 + badge.chars().count());
             let title = if st.title.chars().count() > max {
@@ -967,19 +1068,21 @@ impl<'a> App<'a> {
                 Style::default().fg(PEACH).add_modifier(Modifier::BOLD),
             )));
             for f in &here {
-                out.push(Line::from(view::fit(
-                    vec![
-                        Span::styled(format!("  {} ", f.severity.label()), view::severity_style(f.severity)),
-                        Span::styled(f.title.clone(), text()),
-                    ],
+                let label = format!("  {} ", f.severity.label());
+                let pad = " ".repeat(label.chars().count());
+                out.extend(view::wrapped(
+                    vec![Span::styled(label, view::severity_style(f.severity))],
+                    vec![Span::raw(pad)],
+                    &f.title,
+                    text(),
                     w,
-                )));
+                ));
             }
             out.push(Line::default());
         }
         let cards: Vec<&str> = if in_review { Vec::new() } else { here.iter().map(|f| f.id.as_str()).collect() };
         let all: Vec<review::Finding> = self.findings.clone();
-        let marks: Vec<&review::Finding> = all.iter().collect();
+        let marks: Vec<&review::Finding> = all.iter().filter(|f| !f.withdrawn).collect();
         let mut starts = Vec::new();
         let mut li = 0;
         let mut hmax = 0;
@@ -995,6 +1098,7 @@ impl<'a> App<'a> {
                 Block::Finding(id) => {
                     if let Some(f) = self.findings.iter().find(|f| &f.id == id) {
                         out.extend(view::finding_card(f, Vec::new(), w));
+                        out.extend(view::finding_history(f, w));
                     }
                 }
                 Block::Group(g) => {
@@ -1023,6 +1127,7 @@ impl<'a> App<'a> {
     }
 
     fn draw_main(&mut self, f: &mut Canvas, area: Rect) {
+        self.main_area = area;
         let block = Frame::default().padding(Padding::new(2, 2, 1, 0));
         let inner = block.inner(area);
         self.view_width = inner.width as usize;
@@ -1045,7 +1150,8 @@ impl<'a> App<'a> {
         }
     }
 
-    fn draw_chat(&self, f: &mut Canvas, area: Rect) {
+    fn draw_chat(&mut self, f: &mut Canvas, area: Rect) {
+        self.chat_area = area;
         let busy = if self.chat.busy { " · answering" } else { "" };
         let block = Frame::default()
             .borders(Borders::TOP)
@@ -1064,7 +1170,10 @@ impl<'a> App<'a> {
         .areas(inner);
         let lines = self.chat.transcript(log.width as usize);
         let h = log.height as usize;
-        let end = lines.len().saturating_sub(self.chat.scroll.min(lines.len().saturating_sub(h)));
+        self.chat_page = (h / 2).max(1);
+        self.chat_max = lines.len().saturating_sub(h);
+        self.chat.scroll = self.chat.scroll.min(self.chat_max);
+        let end = lines.len().saturating_sub(self.chat.scroll);
         let start = end.saturating_sub(h);
         f.render_widget(Paragraph::new(lines[start..end].to_vec()), log);
         if let Some((label, _)) = &self.chat.about {
@@ -1081,7 +1190,12 @@ impl<'a> App<'a> {
 
     fn draw_status(&self, f: &mut Canvas, area: Rect) {
         if self.chat.open {
-            let keys = [("enter", "send"), ("esc", "close"), ("pgup/pgdn", "scroll"), ("ctrl-u", "clear")];
+            let keys = [
+                ("enter", "send"),
+                ("esc", "close"),
+                ("↑/↓ pgup/pgdn wheel", "scroll"),
+                ("ctrl-u", "clear"),
+            ];
             let mut spans = vec![Span::raw(" ")];
             for (k, what) in keys {
                 spans.push(Span::styled(k, Style::default().fg(MAUVE).add_modifier(Modifier::BOLD)));

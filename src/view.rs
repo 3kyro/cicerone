@@ -212,19 +212,39 @@ pub fn severity_style(s: Severity) -> Style {
 /// after `prefix`.
 pub fn finding_card(f: &Finding, prefix: Vec<Span<'static>>, w: usize) -> Lines {
     let pw = width(&prefix);
-    let st = severity_style(f.severity);
-    let mut out = vec![Line::from(truncate(
-        [
-            prefix.clone(),
-            vec![
-                Span::styled("◆ ", st),
-                Span::styled(format!("{} ", f.severity.label()), st.add_modifier(Modifier::BOLD)),
-                Span::styled(f.title.clone(), text().add_modifier(Modifier::BOLD)),
-            ],
-        ]
-        .concat(),
-        w,
-    ))];
+    let st = if f.withdrawn { dim() } else { severity_style(f.severity) };
+    let title = if f.withdrawn {
+        dim().add_modifier(Modifier::CROSSED_OUT)
+    } else {
+        text().add_modifier(Modifier::BOLD)
+    };
+    let mut head = vec![
+        Span::styled("◆ ", st),
+        Span::styled(format!("{} ", f.severity.label()), st.add_modifier(Modifier::BOLD)),
+    ];
+    if f.withdrawn {
+        head.push(Span::styled("WITHDRAWN ", Style::default().fg(OVERLAY).add_modifier(Modifier::BOLD)));
+    }
+    let indent = vec![Span::raw(" ".repeat(width(&head)))];
+    let mut out = wrapped([prefix.clone(), head].concat(), [prefix.clone(), indent].concat(), &f.title, title, w);
+    if let Some(last) = f.history.last() {
+        let (icon, what) = if f.withdrawn {
+            ("✕ ", format!("withdrawn: {}", last.reason))
+        } else {
+            ("↻ ", format!("revised {}×: {}", f.history.len(), last.reason))
+        };
+        out.push(Line::from(truncate(
+            [
+                prefix.clone(),
+                vec![
+                    Span::styled(icon, Style::default().fg(PEACH)),
+                    Span::styled(what, Style::default().fg(PEACH).add_modifier(Modifier::ITALIC)),
+                ],
+            ]
+            .concat(),
+            w,
+        )));
+    }
     for l in markdown(&f.body, w.saturating_sub(pw + 2)) {
         let mut spans = prefix.clone();
         spans.push(Span::styled("│ ", st));
@@ -234,12 +254,69 @@ pub fn finding_card(f: &Finding, prefix: Vec<Span<'static>>, w: usize) -> Lines 
     out
 }
 
-pub fn fit(spans: Vec<Span<'static>>, w: usize) -> Vec<Span<'static>> {
-    truncate(spans, w)
+/// Wraps `src` as markdown after `first` on the first line and `rest` on
+/// the others. Plain text takes `style`; code spans keep their own.
+pub fn wrapped(first: Vec<Span<'static>>, rest: Vec<Span<'static>>, src: &str, style: Style, w: usize) -> Lines {
+    let pw = width(&first).max(width(&rest));
+    markdown(src, w.saturating_sub(pw).max(10))
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let mut spans = if i == 0 { first.clone() } else { rest.clone() };
+            spans.extend(l.spans.into_iter().map(|s| {
+                if s.style.fg == Some(TEXT) {
+                    let st = s.style.patch(style);
+                    s.style(st)
+                } else {
+                    s
+                }
+            }));
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// `findings` get a mark on their lines; the ones named in `cards` also get
 /// their card, under the first line they cover.
+/// The earlier states of a finding, newest first, each with why it changed.
+pub fn finding_history(f: &Finding, w: usize) -> Lines {
+    let mut out = Vec::new();
+    if f.history.is_empty() {
+        return out;
+    }
+    out.push(Line::default());
+    out.push(Line::from(Span::styled("History", Style::default().fg(OVERLAY).add_modifier(Modifier::BOLD))));
+    for (i, r) in f.history.iter().enumerate().rev() {
+        let next_body = f.history.get(i + 1).map_or(&f.body, |n| &n.body);
+        out.push(Line::from(truncate(
+            vec![
+                Span::styled(format!("  {}. why it changed: ", i + 1), dim()),
+                Span::styled(r.reason.clone(), Style::default().fg(PEACH)),
+            ],
+            w,
+        )));
+        let was = if r.withdrawn { "WITHDRAWN " } else { "" };
+        out.push(Line::from(truncate(
+            vec![
+                Span::styled("     before: ", dim()),
+                Span::styled(format!("{} {was}", r.severity.label()), severity_style(r.severity)),
+                Span::styled(format!("{}  ", r.title), Style::default().fg(SUBTEXT)),
+                Span::styled(format!("lines {}-{}", r.lines.0, r.lines.1), dim()),
+            ],
+            w,
+        )));
+        if &r.body == next_body {
+            continue;
+        }
+        for l in markdown(&r.body, w.saturating_sub(7)) {
+            let mut spans = vec![Span::raw("       ")];
+            spans.extend(l.spans.into_iter().map(|s| s.style(dim())));
+            out.push(Line::from(spans));
+        }
+    }
+    out
+}
+
 pub fn lens(v: &LensView, focused: bool, w: usize, hs: usize, findings: &[&Finding], cards: &[&str]) -> Lines {
     let frame = Style::default().fg(if focused { MAUVE } else { SURFACE });
     let mut out = Vec::new();
@@ -328,15 +405,13 @@ pub fn lens(v: &LensView, focused: bool, w: usize, hs: usize, findings: &[&Findi
             }
         }
         if let Some(n) = &row.note {
-            out.push(Line::from(truncate(
-                vec![
-                    Span::styled("│", frame),
-                    Span::raw("       "),
-                    Span::styled("╰─ ✦ ", Style::default().fg(PEACH)),
-                    Span::styled(n.clone(), Style::default().fg(PEACH).add_modifier(Modifier::ITALIC)),
-                ],
+            out.extend(wrapped(
+                vec![Span::styled("│", frame), Span::raw("       "), Span::styled("╰─ ✦ ", Style::default().fg(PEACH))],
+                vec![Span::styled("│", frame), Span::raw("            ")],
+                n,
+                Style::default().fg(PEACH).add_modifier(Modifier::ITALIC),
                 w,
-            )));
+            ));
         }
     }
     if v.rows.is_empty() {
@@ -494,14 +569,13 @@ pub fn pattern(ws: &Workspace, id: &str, w: usize) -> Lines {
     }
     if !p.leftovers.is_empty() {
         let first: Vec<String> = p.leftovers.iter().take(3).cloned().collect();
-        out.push(Line::from(truncate(
-            vec![
-                Span::styled("⚠ ", Style::default().fg(YELLOW)),
-                Span::styled(format!("old name still used in {} places: ", p.leftovers.len()), text()),
-                Span::styled(first.join(", "), dim()),
-            ],
+        out.extend(wrapped(
+            vec![Span::styled("⚠ ", Style::default().fg(YELLOW))],
+            vec![Span::raw("  ")],
+            &format!("old name still used in {} places: {}", p.leftovers.len(), first.join(", ")),
+            text(),
             w,
-        )));
+        ));
     }
     out.push(Line::from(Span::styled(
         "The first hunk below is one example. The others are the same substitution.",
