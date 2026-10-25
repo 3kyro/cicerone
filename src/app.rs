@@ -3,6 +3,7 @@ use crate::chat::{self, Chat, Msg, Role};
 use crate::lens::{Lenses, Resolution};
 use crate::plan;
 use crate::review;
+use crate::{report, session};
 use crate::manifest::Workspace;
 use crate::theme::*;
 use crate::tour::{Block, Tour};
@@ -41,6 +42,12 @@ struct Planning {
     started: Instant,
 }
 
+struct ReportJob {
+    text: String,
+    status: String,
+    started: Instant,
+}
+
 pub struct AgentConfig {
     pub root: PathBuf,
     pub model: Option<String>,
@@ -52,6 +59,7 @@ pub struct App<'a> {
     findings: Vec<review::Finding>,
     step_findings: Vec<Vec<usize>>,
     chat_filter: chat::Filter,
+    report: Option<ReportJob>,
     chat: Chat,
     config: Option<AgentConfig>,
     needs_primer: bool,
@@ -104,6 +112,7 @@ impl<'a> App<'a> {
             findings: Vec::new(),
             step_findings: Vec::new(),
             chat_filter: chat::Filter::default(),
+            report: None,
             chat: Chat::default(),
             config: None,
             needs_primer: false,
@@ -313,6 +322,91 @@ impl<'a> App<'a> {
         }
     }
 
+    fn start_report(&mut self) {
+        if self.report.is_some() {
+            return;
+        }
+        if self.planning.is_some() || self.chat.busy {
+            self.notice = Some("The agent is busy. Press E again when it is done.".into());
+            return;
+        }
+        let Some(root) = self.config.as_ref().map(|c| c.root.clone()) else {
+            self.notice = Some("The agent is off (--no-agent), so it cannot write a report.".into());
+            return;
+        };
+        if self.agent.is_none()
+            && let Err(e) = self.start_agent()
+        {
+            self.notice = Some(format!("Could not start the agent: {e}"));
+            return;
+        }
+        let range = format!("{}..{}", self.ws.manifest.base, self.ws.manifest.head);
+        let msg = self.with_primer(report::prompt(&self.findings, &root, &range));
+        if self.agent.as_mut().is_some_and(|a| a.send(&msg).is_ok()) {
+            self.report = Some(ReportJob {
+                text: String::new(),
+                status: "writing the report".into(),
+                started: Instant::now(),
+            });
+        } else {
+            self.notice = Some("Could not reach the agent.".into());
+        }
+    }
+
+    fn on_report_event(&mut self, e: agent::Event) {
+        let Some(job) = &mut self.report else { return };
+        match e {
+            agent::Event::Text(t) => job.text.push_str(&t),
+            agent::Event::Tool(t) => job.status = t,
+            agent::Event::TurnDone { ok } => {
+                let job = self.report.take().unwrap();
+                if !ok || job.text.trim().is_empty() {
+                    self.notice = Some("The agent did not write a report.".into());
+                    return;
+                }
+                self.publish_report(&report::clean(&job.text));
+            }
+            agent::Event::Exited(err) => {
+                self.report = None;
+                self.agent = None;
+                self.events = None;
+                self.notice = Some(format!("The agent stopped while writing the report. {err}"));
+            }
+        }
+    }
+
+    fn publish_report(&mut self, text: &str) {
+        let path = match report::save(text, self.cache.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.notice = Some(format!("Could not save the report: {e}"));
+                return;
+            }
+        };
+        let _ = chat::copy_to_clipboard(&path.display().to_string());
+        let root = self.config.as_ref().map(|c| c.root.clone()).unwrap_or_default();
+        let range = format!("{}..{}", self.ws.manifest.base, self.ws.manifest.head);
+        let title = self.tours[self.current].title.clone();
+        let sent = session::discover(&root).map(|s| {
+            let r = session::send(&s, &report::publish_message(&path, &root, &range, &title));
+            (s.name, r)
+        });
+        self.notice = Some(match sent {
+            Some((name, Ok(()))) => format!(
+                "Report saved to {} (path copied). Claude session '{name}' publishes it as an artifact; the link appears there.",
+                path.display()
+            ),
+            Some((name, Err(e))) => format!(
+                "Report saved to {} (path copied). Sending it to Claude session '{name}' failed: {e}",
+                path.display()
+            ),
+            None => format!(
+                "Report saved to {} (path copied). No Claude session to publish it: open cicerone with /cicerone, or give the path to any agent.",
+                path.display()
+            ),
+        });
+    }
+
     fn on_chat_event(&mut self, e: agent::Event) {
         match e {
             agent::Event::Text(t) => {
@@ -466,6 +560,10 @@ impl<'a> App<'a> {
     }
 
     fn on_event(&mut self, e: agent::Event) {
+        if self.report.is_some() {
+            self.on_report_event(e);
+            return;
+        }
         let Some(p) = &mut self.planning else {
             self.on_chat_event(e);
             return;
@@ -649,7 +747,7 @@ impl<'a> App<'a> {
         while !self.quit {
             self.pump();
             terminal.draw(|f| self.draw(f))?;
-            let tick = if self.planning.is_some() { 80 } else { 250 };
+            let tick = if self.planning.is_some() || self.report.is_some() { 80 } else { 250 };
             if event::poll(Duration::from_millis(tick))? {
                 match event::read()? {
                     Event::Key(k) if k.kind == KeyEventKind::Press => self.key(k),
@@ -921,6 +1019,7 @@ impl<'a> App<'a> {
             KeyCode::Char('d') => self.toggle_diff(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('m') => self.toggle_mouse(),
+            KeyCode::Char('E') => self.start_report(),
             KeyCode::Char('A') => self.switch_tour(if self.current == AUTO { AGENT } else { AUTO }),
             _ => {}
         }
@@ -1044,6 +1143,19 @@ impl<'a> App<'a> {
             Span::styled(" ✦ ", Style::default().fg(PEACH)),
             Span::styled(which, Style::default().fg(SUBTEXT)),
         ])];
+        if let Some(job) = &self.report {
+            const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let i = (job.started.elapsed().as_millis() / 80) as usize % SPIN.len();
+            out.push(Line::from(vec![
+                Span::styled(format!(" {} ", SPIN[i]), Style::default().fg(MAUVE)),
+                Span::styled(
+                    format!("report · {}s", job.started.elapsed().as_secs()),
+                    Style::default().fg(MAUVE),
+                ),
+            ]));
+            let status: String = job.status.chars().take(w.saturating_sub(6)).collect();
+            out.push(Line::from(Span::styled(format!("   {status}"), dim())));
+        }
         if let Some(p) = &self.planning {
             const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let i = (p.started.elapsed().as_millis() / 80) as usize % SPIN.len();
@@ -1259,6 +1371,7 @@ impl<'a> App<'a> {
             ("c", "chat"),
             ("a", "ask"),
             ("A", "tour"),
+            ("E", "report"),
             ("m", if self.mouse { "mouse" } else { "mouse off" }),
             ("?", "help"),
             ("q", "quit"),
@@ -1290,6 +1403,7 @@ fn draw_help(f: &mut Canvas, area: Rect) {
         ("c", "open the chat with the agent"),
         ("ctrl-y", "in the chat: copy the last answer to the clipboard"),
         ("m", "mouse capture off (select text) / on (wheel scroll)"),
+        ("E", "the agent writes a review report; your Claude session publishes it"),
         ("a", "ask about the focused lens"),
         ("esc", "close the chat or this help"),
         ("q", "quit"),
