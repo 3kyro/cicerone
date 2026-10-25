@@ -166,25 +166,73 @@ impl Chat {
         out
     }
 
-    pub fn input_line(&self) -> Line<'static> {
-        let mut spans = vec![Span::styled("› ", Style::default().fg(MAUVE).add_modifier(Modifier::BOLD))];
+    /// The input wrapped at `w` columns, the cursor after the last
+    /// character.
+    pub fn input_lines(&self, w: usize) -> Vec<Line<'static>> {
+        let prompt = Style::default().fg(MAUVE).add_modifier(Modifier::BOLD);
+        let cursor = Span::styled("▍", Style::default().fg(MAUVE));
         if self.input.is_empty() {
-            spans.push(Span::styled("▍", Style::default().fg(MAUVE)));
-            spans.push(Span::styled(
-                if self.about.is_some() { " ask about this lens" } else { " ask about the change" },
-                dim(),
-            ));
-        } else {
-            spans.push(Span::styled(self.input.clone(), text()));
-            spans.push(Span::styled("▍", Style::default().fg(MAUVE)));
+            let hint = if self.about.is_some() { " ask about this lens" } else { " ask about the change" };
+            return vec![Line::from(vec![Span::styled("› ", prompt), cursor, Span::styled(hint, dim())])];
         }
-        Line::from(spans)
+        let room = w.saturating_sub(3).max(1);
+        let mut rows: Vec<String> = vec![String::new()];
+        for word in self.input.split_inclusive(' ') {
+            let mut word: Vec<char> = word.chars().collect();
+            while !word.is_empty() {
+                let row = rows.last_mut().unwrap();
+                let used = row.chars().count();
+                let fits = room.saturating_sub(used);
+                if word.len() <= fits || word.iter().all(|c| *c == ' ') {
+                    row.extend(word.drain(..));
+                } else if used > 0 && word.len() <= room {
+                    rows.push(String::new());
+                } else {
+                    let take = fits.max(1).min(word.len());
+                    row.extend(word.drain(..take));
+                    rows.push(String::new());
+                }
+            }
+        }
+        if rows.len() > 1 && rows.last().is_some_and(String::is_empty) {
+            rows.pop();
+        }
+        let last = rows.len() - 1;
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mut spans = vec![
+                    Span::styled(if i == 0 { "› " } else { "  " }, prompt),
+                    Span::styled(row, text()),
+                ];
+                if i == last {
+                    spans.push(cursor.clone());
+                }
+                Line::from(spans)
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_wraps_and_keeps_the_cursor_at_the_end() {
+        let render = |input: &str, w: usize| -> Vec<String> {
+            let chat = Chat {
+                input: input.into(),
+                ..Chat::default()
+            };
+            chat.input_lines(w)
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        assert_eq!(render("abcdefgh", 6), vec!["› abc", "  def", "  gh▍"]);
+        assert_eq!(render("why does it log", 10), vec!["› why ", "  does ", "  it log▍"]);
+    }
 
     #[test]
     fn filter_takes_out_update_lines_across_chunks() {

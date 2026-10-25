@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 const AUTO: usize = 0;
 const HSTEP: usize = 8;
+const MAX_INPUT_LINES: usize = 6;
 const AGENT: usize = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1170,10 +1171,12 @@ impl<'a> App<'a> {
         let inner = block.inner(area);
         f.render_widget(block, area);
         let about_h = u16::from(self.chat.about.is_some());
+        let typed = self.chat.input_lines(inner.width as usize);
+        let input_h = typed.len().clamp(1, MAX_INPUT_LINES);
         let [log, about, input] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(about_h),
-            Constraint::Length(1),
+            Constraint::Length(input_h as u16),
         ])
         .areas(inner);
         let lines = self.chat.transcript(log.width as usize);
@@ -1193,7 +1196,8 @@ impl<'a> App<'a> {
                 about,
             );
         }
-        f.render_widget(Paragraph::new(self.chat.input_line()), input);
+        let skip = typed.len().saturating_sub(input_h);
+        f.render_widget(Paragraph::new(typed[skip..].to_vec()), input);
     }
 
     fn draw_status(&self, f: &mut Canvas, area: Rect) {
