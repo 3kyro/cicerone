@@ -121,6 +121,27 @@ impl Finding {
         Some(what.join(", "))
     }
 
+    /// Checks the new lines first, so the history holds only changes that
+    /// happened.
+    pub fn revise_in(&mut self, mut u: Update, ws: &Workspace) -> Option<String> {
+        let mut rejected = false;
+        if let Some(l) = u.lines {
+            let mut probe = self.clone();
+            probe.lines = l;
+            if clamp(&mut probe, ws) {
+                u.lines = Some(probe.lines);
+            } else {
+                u.lines = None;
+                rejected = true;
+            }
+        }
+        match (self.revise(u), rejected) {
+            (Some(what), true) => Some(format!("{what} (new lines are outside the file, kept the old ones)")),
+            (None, true) => Some("not changed: the new lines are outside the file".into()),
+            (what, false) => what,
+        }
+    }
+
     pub fn withdraw(&mut self, reason: &str) -> bool {
         if self.withdrawn {
             return false;
@@ -315,6 +336,27 @@ mod tests {
         assert!(Severity::Risk < Severity::Change && Severity::Change < Severity::Question);
         let f: Finding = serde_json::from_str(r#"{"severity":"change","title":"t","file":"A.hs","lines":[1,1]}"#).unwrap();
         assert_eq!(f.severity.label(), "CHANGE");
+    }
+
+    #[test]
+    fn lines_outside_the_file_are_not_recorded() {
+        let ws = ws();
+        let mut f = finding(Severity::Risk, "A.hs", (1, 2));
+        let u = |lines, severity| Update {
+            id: "F1".into(),
+            severity,
+            title: None,
+            body: None,
+            lines: Some(lines),
+            reason: "r".into(),
+        };
+        assert_eq!(f.revise_in(u((9, 12), None), &ws).as_deref(), Some("not changed: the new lines are outside the file"));
+        assert!(f.history.is_empty() && f.lines == (1, 2));
+        let what = f.revise_in(u((9, 12), Some(Severity::Change)), &ws).unwrap();
+        assert!(what.starts_with("RISK → CHANGE (new lines"), "{what}");
+        assert_eq!((f.lines, f.history.len()), ((1, 2), 1));
+        assert_eq!(f.revise_in(u((3, 99), None), &ws).as_deref(), Some("lines"));
+        assert_eq!(f.lines, (3, 4));
     }
 
     #[test]

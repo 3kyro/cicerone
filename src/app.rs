@@ -350,14 +350,7 @@ impl<'a> App<'a> {
                     self.findings
                         .iter_mut()
                         .find(|f| f.id == id)
-                        .and_then(|f| {
-                            let before = f.lines;
-                            let what = f.revise(u)?;
-                            if !review::clamp(f, ws) {
-                                f.lines = before;
-                            }
-                            Some(what)
-                        })
+                        .and_then(|f| f.revise_in(u, ws))
                         .map(|what| format!("{id} {what}: {reason}"))
                 }
                 Some(plan::Parsed::Withdraw(w)) => self
