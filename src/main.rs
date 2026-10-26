@@ -3,6 +3,7 @@ mod app;
 mod chat;
 mod diff;
 mod git;
+mod github;
 mod highlight;
 mod lens;
 mod manifest;
@@ -21,7 +22,7 @@ use manifest::{Change, Manifest, Place};
 use std::path::PathBuf;
 
 const USAGE: &str = "\
-usage: cicerone [review] [--tour <file>] [--no-agent] [--replan] [--model <m>] [-C <dir>] [<range>]
+usage: cicerone [review] [--tour <file>] [--no-agent] [--replan] [--model <m>] [--pr <n|url>] [-C <dir>] [<range>]
        cicerone tour [-C <dir>] [<range>]
        cicerone plan [--model <m>] [-C <dir>] [<range>]
        cicerone manifest [--json] [-C <dir>] [<range>]
@@ -46,6 +47,7 @@ fn main() -> Result<()> {
     let (mut json, mut dir, mut spec, mut tour_file) = (false, PathBuf::from("."), None, None);
     let mut snapshot: Option<String> = None;
     let (mut no_agent, mut replan, mut model) = (false, false, None);
+    let mut pr: Option<u64> = None;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -56,6 +58,11 @@ fn main() -> Result<()> {
             "--no-agent" => no_agent = true,
             "--replan" => replan = true,
             "--model" => model = it.next(),
+            "--pr" => {
+                let v = it.next().unwrap_or_default();
+                let n = v.trim_end_matches('/').rsplit('/').next().unwrap_or("").parse().ok();
+                pr = Some(n.with_context(|| format!("--pr needs a number or a PR url, not {v}"))?);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -143,6 +150,16 @@ fn main() -> Result<()> {
                 session: session.filter(|_| tour.is_none()),
             });
             let findings = review::load(cache.as_deref(), &ws);
+            if let (Some(d), Some(n)) = (&cache, pr) {
+                let _ = std::fs::create_dir_all(d);
+                let _ = std::fs::write(d.join("pr"), n.to_string());
+            }
+            let pr = pr.or_else(|| {
+                cache
+                    .as_ref()
+                    .and_then(|d| std::fs::read_to_string(d.join("pr")).ok())
+                    .and_then(|s| s.trim().parse().ok())
+            });
             let app = if tour.is_some() || no_agent || cached.is_some() {
                 let resumable = cached.is_some() && config.is_some();
                 let app = app::App::new(&ws, auto, tour.or(cached)).with_config(config, cache.clone());
@@ -161,6 +178,7 @@ fn main() -> Result<()> {
                     .with_config(config, cache.clone())
                     .planning_with(a, rx)
             };
+            let app = app.with_github(repo.root.clone(), pr);
             let mut terminal = ratatui::init();
             let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture);
             let res = app.run(&mut terminal);

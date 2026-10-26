@@ -3,7 +3,7 @@ use crate::chat::{self, Chat, Msg, Role};
 use crate::lens::{Lenses, Resolution};
 use crate::plan;
 use crate::review;
-use crate::{report, session};
+use crate::{github, report, session};
 use crate::manifest::Workspace;
 use crate::theme::*;
 use crate::tour::{Block, Tour};
@@ -60,6 +60,9 @@ pub struct App<'a> {
     step_findings: Vec<Vec<usize>>,
     chat_filter: chat::Filter,
     report: Option<ReportJob>,
+    root: PathBuf,
+    pr: Option<u64>,
+    compose: bool,
     chat: Chat,
     config: Option<AgentConfig>,
     needs_primer: bool,
@@ -113,6 +116,9 @@ impl<'a> App<'a> {
             step_findings: Vec::new(),
             chat_filter: chat::Filter::default(),
             report: None,
+            root: PathBuf::new(),
+            pr: None,
+            compose: false,
             chat: Chat::default(),
             config: None,
             needs_primer: false,
@@ -406,6 +412,97 @@ impl<'a> App<'a> {
         });
     }
 
+    fn draft_path(&self) -> PathBuf {
+        match &self.cache {
+            Some(d) => d.join("github-review.md"),
+            None => std::env::temp_dir().join(format!("cicerone-github-review-{}.md", std::process::id())),
+        }
+    }
+
+    /// Opens the GitHub review in the editor, then posts what the user saved.
+    fn compose_review(&mut self, terminal: &mut DefaultTerminal) {
+        if self.ws.manifest.head == "worktree" {
+            self.notice = Some("Posting needs a commit range: the working tree has no PR commit.".into());
+            return;
+        }
+        let commit = match crate::git::Repo::discover(&self.root)
+            .and_then(|r| r.git(&["rev-parse", &self.ws.manifest.head]))
+        {
+            Ok(c) => c.trim().to_string(),
+            Err(e) => {
+                self.notice = Some(format!("Could not resolve the head commit: {e}"));
+                return;
+            }
+        };
+        let Some(pr) = self.pr.or_else(|| github::find_pr(&self.root, &commit)) else {
+            self.notice = Some(format!(
+                "No open PR has {} as its head. Open cicerone with --pr <n>.",
+                self.ws.manifest.head
+            ));
+            return;
+        };
+        self.pr = Some(pr);
+        let path = self.draft_path();
+        if !path.exists() {
+            let intent = self.tours[AGENT].intent.clone();
+            if let Err(e) = std::fs::write(&path, github::compose(self.ws, &self.findings, &intent, pr)) {
+                self.notice = Some(format!("Could not write the draft: {e}"));
+                return;
+            }
+        }
+        let edited = suspend(terminal, self.mouse, || {
+            let editor = ["GIT_EDITOR", "VISUAL", "EDITOR"]
+                .iter()
+                .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+                .unwrap_or_else(|| "vi".into());
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{editor} \"$1\""))
+                .arg("sh")
+                .arg(&path)
+                .status()
+        });
+        if !edited.is_ok_and(|s| s.success()) {
+            self.notice = Some("The editor failed. Nothing was posted; S opens the draft again.".into());
+            return;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let draft = match github::parse(&text).and_then(|d| {
+            if let Some(d) = &d {
+                github::check(d, self.ws)?;
+            }
+            Ok(d)
+        }) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                let _ = std::fs::remove_file(&path);
+                self.notice = Some("Cancelled. Nothing was posted.".into());
+                return;
+            }
+            Err(e) => {
+                self.notice = Some(format!("Not posted: {e}. S opens your draft again."));
+                return;
+            }
+        };
+        let payload = github::payload(&draft, &commit);
+        if std::env::var_os("CICERONE_POST_DRY_RUN").is_some() {
+            let out = path.with_file_name("github-payload.json");
+            let _ = std::fs::write(&out, serde_json::to_string_pretty(&payload).unwrap_or_default());
+            self.notice = Some(format!("Dry run: the review for PR #{pr} is in {}. Nothing was posted.", out.display()));
+            return;
+        }
+        match github::post(&self.root, pr, &payload) {
+            Ok(url) => {
+                let _ = std::fs::remove_file(&path);
+                if let Some(d) = &self.cache {
+                    let _ = std::fs::write(d.join("posted"), format!("{url}\n"));
+                }
+                self.notice = Some(format!("Posted the review on PR #{pr}: {url}"));
+            }
+            Err(e) => self.notice = Some(format!("Not posted: {e}. S opens your draft again.")),
+        }
+    }
+
     fn on_chat_event(&mut self, e: agent::Event) {
         match e {
             agent::Event::Text(t) => {
@@ -678,6 +775,12 @@ impl<'a> App<'a> {
         }
     }
 
+    pub fn with_github(mut self, root: PathBuf, pr: Option<u64>) -> Self {
+        self.root = root;
+        self.pr = pr;
+        self
+    }
+
     pub fn with_findings(mut self, findings: Vec<review::Finding>) -> Self {
         self.findings = findings;
         self.sync_findings();
@@ -749,7 +852,12 @@ impl<'a> App<'a> {
             let tick = if self.planning.is_some() || self.report.is_some() { 80 } else { 250 };
             if event::poll(Duration::from_millis(tick))? {
                 match event::read()? {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => self.key(k),
+                    Event::Key(k) if k.kind == KeyEventKind::Press => {
+                        self.key(k);
+                        if std::mem::take(&mut self.compose) {
+                            self.compose_review(terminal);
+                        }
+                    }
                     Event::Mouse(m) => self.mouse(m),
                     _ => {}
                 }
@@ -1019,6 +1127,7 @@ impl<'a> App<'a> {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('m') => self.toggle_mouse(),
             KeyCode::Char('E') => self.start_report(),
+            KeyCode::Char('S') => self.compose = true,
             KeyCode::Char('A') => self.switch_tour(if self.current == AUTO { AGENT } else { AUTO }),
             _ => {}
         }
@@ -1371,6 +1480,7 @@ impl<'a> App<'a> {
             ("a", "ask"),
             ("A", "tour"),
             ("E", "report"),
+            ("S", "post"),
             ("m", if self.mouse { "mouse" } else { "mouse off" }),
             ("?", "help"),
             ("q", "quit"),
@@ -1403,6 +1513,7 @@ fn draw_help(f: &mut Canvas, area: Rect) {
         ("ctrl-y", "in the chat: copy the last answer to the clipboard"),
         ("m", "mouse capture off (select text) / on (wheel scroll)"),
         ("E", "the agent writes a review report; your Claude session publishes it"),
+        ("S", "post the review on the PR: edit it first, as Claude or as you"),
         ("a", "ask about the focused lens"),
         ("esc", "close the chat or this help"),
         ("q", "quit"),
@@ -1432,4 +1543,18 @@ fn draw_help(f: &mut Canvas, area: Rect) {
         .padding(Padding::uniform(1))
         .style(Style::default().bg(MANTLE));
     f.render_widget(Paragraph::new(lines).block(block), r);
+}
+
+/// Runs `f` with the terminal handed back to the shell, for an editor.
+fn suspend<T>(terminal: &mut DefaultTerminal, mouse: bool, f: impl FnOnce() -> T) -> T {
+    use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+    let out = f();
+    *terminal = ratatui::init();
+    if mouse {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    }
+    let _ = terminal.clear();
+    out
 }
