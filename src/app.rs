@@ -4,7 +4,7 @@ use crate::lens::{Lenses, Resolution};
 use crate::classes::Classes;
 use crate::plan::{self, Phase};
 use crate::review;
-use crate::{github, report, session};
+use crate::{github, report, session, split};
 use crate::manifest::Workspace;
 use crate::theme::*;
 use crate::tour::{Block, Tour};
@@ -36,6 +36,15 @@ struct Planning {
     started: Instant,
     /// A cached tour that has no review yet: stop after the review turn.
     review_only: bool,
+    helpers: Option<Helpers>,
+}
+
+struct Helpers {
+    parts: Vec<Vec<String>>,
+    rx: Receiver<split::Msg>,
+    done: usize,
+    findings: Vec<String>,
+    failed: Vec<String>,
 }
 
 struct ReportJob {
@@ -165,19 +174,58 @@ impl<'a> App<'a> {
         self
     }
 
-    pub fn planning_with(mut self, agent: Agent, events: Receiver<agent::Event>) -> Self {
+    pub fn planning_with(
+        mut self,
+        agent: Agent,
+        events: Receiver<agent::Event>,
+        helpers: Option<(Vec<Vec<String>>, Receiver<split::Msg>)>,
+    ) -> Self {
         self.agent = Some(agent);
         self.events = Some(events);
         self.classes = Some(Classes::default());
         self.planning = Some(Planning {
             parser: plan::Parser::default(),
-            phase: Phase::Review,
+            phase: if helpers.is_some() { Phase::Split } else { Phase::Review },
             status: "reading the change".into(),
             error: None,
             started: Instant::now(),
             review_only: false,
+            helpers: helpers.map(|(parts, rx)| Helpers {
+                parts,
+                rx,
+                done: 0,
+                findings: Vec::new(),
+                failed: Vec::new(),
+            }),
         });
         self
+    }
+
+    /// Collects the helpers' reviews; when the last part is done, the main
+    /// session checks and merges them.
+    fn pump_helpers(&mut self) {
+        let Some(p) = &mut self.planning else { return };
+        let Some(h) = &mut p.helpers else { return };
+        for m in h.rx.try_iter() {
+            match m {
+                split::Msg::Finding(f) => h.findings.push(f),
+                split::Msg::Tool(t) => p.status = t,
+                split::Msg::Done { part, ok } => {
+                    h.done += 1;
+                    if !ok {
+                        h.failed.push(format!("part {}: {}", part + 1, h.parts[part].join(", ")));
+                    }
+                }
+            }
+        }
+        if h.done < h.parts.len() {
+            return;
+        }
+        let h = p.helpers.take().unwrap();
+        let msg = split::merge_prompt(self.ws, h.parts.len(), &h.findings, &h.failed);
+        if !self.turn(&msg, Phase::Review, Phase::Review.status().into()) {
+            self.end_planning();
+        }
     }
 
     pub fn with_classes(mut self, classes: Option<Classes>) -> Self {
@@ -678,6 +726,7 @@ impl<'a> App<'a> {
     }
 
     fn pump(&mut self) {
+        self.pump_helpers();
         let Some(rx) = &self.events else { return };
         let events: Vec<agent::Event> = rx.try_iter().collect();
         for e in events {
@@ -800,6 +849,7 @@ impl<'a> App<'a> {
             error: None,
             started: Instant::now(),
             review_only: true,
+            helpers: None,
         });
         if !self.agent.as_mut().is_some_and(|a| a.send(&msg).is_ok()) {
             self.planning = None;
@@ -1316,15 +1366,19 @@ impl<'a> App<'a> {
             out.push(Line::from(Span::styled(format!("   {status}"), dim())));
             if !p.review_only {
                 let at = match p.phase {
-                    Phase::Review => 0,
+                    Phase::Split | Phase::Review => 0,
                     Phase::Classify { .. } => 1,
                     Phase::Plan | Phase::Cover => 2,
                 };
                 let open = self.findings.iter().filter(|f| !f.withdrawn).count();
                 let classified = self.classes.as_ref().map_or(0, |c| c.hunks.len());
                 let total = self.ws.manifest.hunks.len();
+                let review = match &p.helpers {
+                    Some(h) => format!("review · parts {}/{} · {} raw findings", h.done, h.parts.len(), h.findings.len()),
+                    None => format!("review · {open} findings"),
+                };
                 for (k, name) in [
-                    format!("review · {open} findings"),
+                    review,
                     format!("classify · {classified}/{total} hunks"),
                     "tour".to_string(),
                 ]

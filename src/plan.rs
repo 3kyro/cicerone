@@ -60,7 +60,7 @@ When the conversation shows that a finding is wrong, too severe, too mild, or ne
 Do this only when the evidence supports it, and say so in the text too. Never put other JSON in an answer.
 An intended behavior change is still a finding: when the reviewer confirms that it is intended, change a bug or risk about it to "change", never to "nit"."#;
 
-const MAX_DIFF: usize = 400_000;
+const MAX_DIFF: usize = crate::split::WHOLE;
 
 /// The first turn: the whole change, and the review request.
 pub fn prompt(ws: &Workspace) -> String {
@@ -454,6 +454,8 @@ pub fn save(tour: &Tour, cache: Option<&std::path::Path>) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// Helper sessions review a large change in parts.
+    Split,
     Review,
     Classify { retried: bool },
     Plan,
@@ -463,6 +465,7 @@ pub enum Phase {
 impl Phase {
     pub fn status(self) -> &'static str {
         match self {
+            Phase::Split => "reviewing in parts",
             Phase::Review => "reviewing",
             Phase::Classify { .. } => "classifying the hunks",
             Phase::Plan => "planning the tour",
@@ -486,6 +489,7 @@ pub fn after(
     classes: &mut Classes,
 ) -> Next {
     match done {
+        Phase::Split => Next::Done,
         Phase::Review => Next::Send(classify_prompt(), Phase::Classify { retried: false }),
         Phase::Classify { retried } => {
             let missing = classes.missing(ws);

@@ -13,6 +13,7 @@ mod plan;
 mod report;
 mod review;
 mod session;
+mod split;
 mod syntax;
 mod theme;
 mod tour;
@@ -110,7 +111,25 @@ fn main() -> Result<()> {
                 .head
                 .as_deref()
                 .and_then(|h| plan::cache_dir(&repo.root, &range.base, h));
-            let (mut agent, rx, _) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
+            let (mut agent, rx, _, parts) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
+            if let Some(parts) = parts {
+                eprintln!("reviewing in {} parts", parts.len());
+                let helpers = split::start(&ws, &parts, helper_options(&repo, &ws, cache.as_deref(), model.as_deref()));
+                let (mut findings, mut failed) = (Vec::new(), Vec::new());
+                for m in helpers {
+                    match m {
+                        split::Msg::Finding(f) => findings.push(f),
+                        split::Msg::Tool(t) => eprintln!("helper tool: {}", clean(&t)),
+                        split::Msg::Done { part, ok } => {
+                            eprintln!("part {} {}", part + 1, if ok { "done" } else { "failed" });
+                            if !ok {
+                                failed.push(format!("part {}: {}", part + 1, parts[part].join(", ")));
+                            }
+                        }
+                    }
+                }
+                agent.send(&split::merge_prompt(&ws, parts.len(), &findings, &failed))?;
+            }
             let t = plan::run_headless(&ws, &mut agent, rx, cache.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&t)?);
         }
@@ -174,14 +193,18 @@ fn main() -> Result<()> {
                     None => app,
                 }
             } else {
-                let (a, rx, session) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
+                let (a, rx, session, parts) = start_planner(&repo, &ws, cache.as_deref(), model.as_deref())?;
+                let helpers = parts.map(|p| {
+                    let rx = split::start(&ws, &p, helper_options(&repo, &ws, cache.as_deref(), model.as_deref()));
+                    (p, rx)
+                });
                 let config = config.map(|c| app::AgentConfig {
                     session: Some(session),
                     ..c
                 });
                 app::App::new(&ws, auto, None)
                     .with_config(config, cache.clone())
-                    .planning_with(a, rx)
+                    .planning_with(a, rx, helpers)
             };
             let app = app.with_github(repo.root.clone(), pr).with_classes(classes);
             let mut terminal = ratatui::init();
@@ -195,12 +218,34 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn helper_options(
+    repo: &git::Repo,
+    ws: &manifest::Workspace,
+    cache: Option<&std::path::Path>,
+    model: Option<&str>,
+) -> split::Options {
+    split::Options {
+        cwd: repo.root.clone(),
+        model: model.map(str::to_string),
+        files: ws.snapshot.clone(),
+        tools: cache.map(|d| d.join("tools.log")),
+    }
+}
+
+/// Starts the main session. For a change too large for one session it
+/// returns the parts, and the first message waits for their reviews.
+#[allow(clippy::type_complexity)]
 fn start_planner(
     repo: &git::Repo,
     ws: &manifest::Workspace,
     cache: Option<&std::path::Path>,
     model: Option<&str>,
-) -> Result<(agent::Agent, std::sync::mpsc::Receiver<agent::Event>, String)> {
+) -> Result<(
+    agent::Agent,
+    std::sync::mpsc::Receiver<agent::Event>,
+    String,
+    Option<Vec<Vec<String>>>,
+)> {
     let session = agent::new_session_id();
     if let Some(d) = cache {
         std::fs::create_dir_all(d)?;
@@ -222,8 +267,11 @@ fn start_planner(
         },
         tx,
     )?;
-    a.send(&plan::prompt(ws))?;
-    Ok((a, rx, session))
+    let parts = split::parts(ws);
+    if parts.is_none() {
+        a.send(&plan::prompt(ws))?;
+    }
+    Ok((a, rx, session, parts))
 }
 
 pub fn clean(s: &str) -> String {
