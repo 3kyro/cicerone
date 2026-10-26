@@ -42,6 +42,7 @@ RULES
    - In the shapes stage, show functions at "signature" and changed types at "signature". Show a new type at "full" only when it is short.
    - Show a function longer than 15 lines first at "skeleton", with a label on each hole that hides something the reader must know. Show it at "full" only in a later step, with "focus" on the lines that matter.
    - Use "notes" for the one to three lines in a step that a reviewer must not miss.
+   - Symbol lenses exist only for files with symbols in the manifest. For any other file, zoom with a file lens: "resolution": "skeleton" and "holes" that fold the parts the reader can skip at first, each with a label. A hole folds its lines at "skeleton" and shows them at "full". Keep the holes inside the lens lines.
 8. To read more context, use Read, Grep, and Glob on the FILES directory named in the material, and on the repository working tree. The working tree can differ from head.
 9. 4 to 8 stages. 1 to 4 lenses per step.
 10. Show the code of each finding at "skeleton" or "full" in the step where the reader first meets that code, so the reader sees the problem in context. cicerone puts the finding next to its lines.

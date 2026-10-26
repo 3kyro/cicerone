@@ -183,7 +183,8 @@ impl Lenses {
                 Resolution::Skeleton,
                 Resolution::Full,
             ],
-            None => vec![Resolution::Full],
+            None if spec.holes.is_empty() => vec![Resolution::Full],
+            None => vec![Resolution::Skeleton, Resolution::Full],
         }
     }
 
@@ -222,12 +223,17 @@ impl Lenses {
         let diff = diff.or(spec.diff).unwrap_or(true);
         let fv = self.file(file);
         let picked: Vec<&URow> = fv.rows.iter().enumerate().filter(|(i, r)| pick(r, *i)).map(|(_, r)| r).collect();
-        let rows = fold(fv, &picked, |_| true, diff, spec);
+        let folded = if res == Resolution::Skeleton {
+            in_holes(&picked, &spec.holes)
+        } else {
+            vec![false; picked.len()]
+        };
+        let rows = fold(fv, &picked, |i, _| !folded[i], diff, spec);
         LensView {
             file: file.diff.path.clone(),
             title,
             place: place(&file.diff.path, &picked),
-            resolution: Resolution::Full,
+            resolution: res,
             available,
             diff,
             rows,
@@ -354,7 +360,7 @@ impl Lenses {
             }
             _ => Box::new(|_: &URow| true),
         };
-        let rows = fold(fv, &picked, keep, diff, spec);
+        let rows = fold(fv, &picked, |_, r| keep(r), diff, spec);
         LensView {
             file: sym.file.clone(),
             title,
@@ -397,7 +403,7 @@ const MIN_HOLE: usize = 1;
 fn fold(
     fv: &FileView,
     picked: &[&URow],
-    keep: impl Fn(&URow) -> bool,
+    keep: impl Fn(usize, &URow) -> bool,
     diff: bool,
     spec: &LensSpec,
 ) -> Vec<Row> {
@@ -477,14 +483,14 @@ fn fold(
         });
         hidden.clear();
     };
-    for r in picked {
+    for (i, r) in picked.iter().enumerate() {
         if r.kind == Line::Del && !diff {
             if !hidden.is_empty() {
                 hidden.push(r);
             }
             continue;
         }
-        if !keep(r) {
+        if !keep(i, r) {
             hidden.push(r);
             continue;
         }
@@ -493,6 +499,26 @@ fn fold(
     }
     flush(&mut hidden, &mut out);
     out
+}
+
+/// For each row, whether a hole folds it. A removed row belongs to the
+/// head line that follows it.
+fn in_holes(rows: &[&URow], holes: &[HoleLabel]) -> Vec<bool> {
+    let ranges: Vec<(usize, usize)> = holes
+        .iter()
+        .map(|h| (h.lines.0.min(h.lines.1), h.lines.0.max(h.lines.1)))
+        .collect();
+    let inside = |n: usize| ranges.iter().any(|&(a, b)| a <= n && n <= b);
+    let mut next = 1;
+    rows.iter()
+        .map(|r| match r.new {
+            Some(n) => {
+                next = n + 1;
+                inside(n)
+            }
+            None => inside(next),
+        })
+        .collect()
 }
 
 fn build_file(f: &FileData) -> FileView {
@@ -628,5 +654,52 @@ mod tests {
         assert_eq!(at(1), (Line::Del, Some(2), None));
         assert_eq!(at(2), (Line::Add, None, Some(2)));
         assert_eq!(at(5), (Line::Add, None, Some(5)));
+    }
+
+    #[test]
+    fn holes_give_any_file_a_skeleton() {
+        let mut f = data("a\nb\nc\nd\ne\n", "a\nb\nC\nd\ne\n", Vec::new());
+        f.lang = None;
+        f.diff.path = "notes.md".into();
+        f.diff.hunks = vec![Hunk {
+            id: "H1".into(),
+            old_start: 3,
+            old_len: 1,
+            new_start: 3,
+            new_len: 1,
+            lines: vec!["-c".into(), "+C".into()],
+        }];
+        let ws = Workspace {
+            manifest: crate::manifest::Manifest {
+                base: "a".into(),
+                head: "b".into(),
+                files: Vec::new(),
+                symbols: Vec::new(),
+                hunks: Vec::new(),
+                patterns: Vec::new(),
+                order: Vec::new(),
+            },
+            files: vec![f],
+            snapshot: None,
+        };
+        let mut spec = LensSpec::lines("notes.md", 1, 5);
+        assert_eq!(Lenses::available(&ws, &spec), vec![Resolution::Full]);
+        spec.holes = vec![HoleLabel {
+            lines: (4, 2),
+            label: "the rename".into(),
+        }];
+        assert_eq!(Lenses::available(&ws, &spec), vec![Resolution::Skeleton, Resolution::Full]);
+        let mut lenses = Lenses::default();
+        let v = lenses.view(&ws, &spec, Resolution::Skeleton, None);
+        let kinds: Vec<String> = v
+            .rows
+            .iter()
+            .map(|r| match &r.kind {
+                RowKind::Hole { label, count, .. } => format!("hole {label} {count}"),
+                _ => r.text.clone(),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["a", "hole the rename 3", "e"]);
+        assert_eq!(lenses.view(&ws, &spec, Resolution::Full, None).rows.len(), 6);
     }
 }
