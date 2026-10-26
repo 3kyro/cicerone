@@ -103,6 +103,8 @@ pub struct App<'a> {
     chat_page: usize,
     chat_max: usize,
     mouse: bool,
+    /// False in snapshots, where escape sequences would land in the output.
+    terminal: bool,
     quit: bool,
 }
 
@@ -161,6 +163,7 @@ impl<'a> App<'a> {
             chat_page: 1,
             chat_max: 0,
             mouse: true,
+            terminal: true,
             quit: false,
         };
         app.refresh_steps();
@@ -947,6 +950,7 @@ impl<'a> App<'a> {
     /// The screen after `keys`, as plain text. Each key is one char, except
     /// `<tab>`, `<down>`, and the like.
     pub fn snapshot(mut self, keys: &str, w: u16, h: u16) -> Result<String> {
+        self.terminal = false;
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))?;
         term.draw(|f| self.draw(f))?;
         let mut rest = keys;
@@ -1074,9 +1078,14 @@ impl<'a> App<'a> {
 
     fn copy_last_answer(&mut self) {
         let last = self.chat.msgs.iter().rev().find(|m| m.role == Role::Agent);
+        let terminal = self.terminal;
         self.chat.flash = Some(match last {
+            Some(m) if !terminal => format!("would send {} characters to the clipboard", m.text.trim().chars().count()),
             Some(m) => match chat::copy_to_clipboard(m.text.trim()) {
-                Ok(()) => format!("copied {} characters", m.text.trim().chars().count()),
+                Ok(()) => format!(
+                    "sent {} characters to the clipboard (needs OSC 52 in the terminal)",
+                    m.text.trim().chars().count()
+                ),
                 Err(e) => format!("copy failed: {e}"),
             },
             None => "nothing to copy yet".into(),
@@ -1085,12 +1094,16 @@ impl<'a> App<'a> {
 
     fn toggle_mouse(&mut self) {
         use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
-        self.mouse = !self.mouse;
-        let _ = if self.mouse {
-            ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture)
-        } else {
-            ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture)
-        };
+        let on = !self.mouse;
+        let sent = !self.terminal
+            || if on {
+                ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok()
+            } else {
+                ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture).is_ok()
+            };
+        if sent {
+            self.mouse = on;
+        }
     }
 
     fn chat_key(&mut self, k: KeyEvent) {
@@ -1620,7 +1633,7 @@ fn draw_help(f: &mut Canvas, area: Rect) {
         ("d", "show or hide removed lines and markers"),
         ("A", "switch between the agent tour and the automatic tour"),
         ("c", "open the chat with the agent"),
-        ("ctrl-y", "in the chat: copy the last answer to the clipboard"),
+        ("ctrl-y", "in the chat: copy the last answer (terminal needs OSC 52)"),
         ("m", "mouse capture off (select text) / on (wheel scroll)"),
         ("E", "the agent writes a review report; your Claude session publishes it"),
         ("S", "post the review on the PR: edit it first, as Claude or as you"),
@@ -1637,7 +1650,8 @@ fn draw_help(f: &mut Canvas, area: Rect) {
             ])
         })
         .collect();
-    let w = 70.min(area.width);
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (widest + 4).min(area.width);
     let h = (rows.len() as u16 + 4).min(area.height);
     let r = Rect {
         x: area.x + (area.width - w) / 2,
