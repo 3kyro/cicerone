@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod chat;
+mod classes;
 mod diff;
 mod git;
 mod github;
@@ -131,13 +132,17 @@ fn main() -> Result<()> {
                 .head
                 .as_deref()
                 .and_then(|h| plan::cache_dir(&repo.root, &range.base, h));
+            let classes = cache
+                .as_deref()
+                .filter(|_| !replan)
+                .and_then(|d| classes::Classes::load(Some(d), &ws));
             let cached: Option<tour::Tour> = cache
                 .as_ref()
                 .filter(|_| !replan)
                 .and_then(|d| std::fs::read_to_string(d.join("tour.json")).ok())
                 .and_then(|j| serde_json::from_str::<tour::Tour>(&j).ok())
                 .map(|mut t| {
-                    plan::refresh(&mut t, &ws);
+                    plan::refresh(&mut t, &ws, classes.as_ref());
                     t
                 });
             let session = cache
@@ -178,7 +183,7 @@ fn main() -> Result<()> {
                     .with_config(config, cache.clone())
                     .planning_with(a, rx)
             };
-            let app = app.with_github(repo.root.clone(), pr);
+            let app = app.with_github(repo.root.clone(), pr).with_classes(classes);
             let mut terminal = ratatui::init();
             let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture);
             let res = app.run(&mut terminal);

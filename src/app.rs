@@ -1,7 +1,8 @@
 use crate::agent::{self, Agent};
 use crate::chat::{self, Chat, Msg, Role};
 use crate::lens::{Lenses, Resolution};
-use crate::plan;
+use crate::classes::Classes;
+use crate::plan::{self, Phase};
 use crate::review;
 use crate::{github, report, session};
 use crate::manifest::Workspace;
@@ -27,19 +28,14 @@ const HSTEP: usize = 8;
 const MAX_INPUT_LINES: usize = 6;
 const AGENT: usize = 1;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Plan,
-    Cover,
-    Review,
-}
-
 struct Planning {
     parser: plan::Parser,
     phase: Phase,
     status: String,
     error: Option<String>,
     started: Instant,
+    /// A cached tour that has no review yet: stop after the review turn.
+    review_only: bool,
 }
 
 struct ReportJob {
@@ -57,6 +53,7 @@ pub struct AgentConfig {
 pub struct App<'a> {
     ws: &'a Workspace,
     findings: Vec<review::Finding>,
+    classes: Option<Classes>,
     step_findings: Vec<Vec<usize>>,
     chat_filter: chat::Filter,
     report: Option<ReportJob>,
@@ -114,6 +111,7 @@ impl<'a> App<'a> {
         let mut app = App {
             ws,
             findings: Vec::new(),
+            classes: None,
             step_findings: Vec::new(),
             chat_filter: chat::Filter::default(),
             report: None,
@@ -170,13 +168,20 @@ impl<'a> App<'a> {
     pub fn planning_with(mut self, agent: Agent, events: Receiver<agent::Event>) -> Self {
         self.agent = Some(agent);
         self.events = Some(events);
+        self.classes = Some(Classes::default());
         self.planning = Some(Planning {
             parser: plan::Parser::default(),
-            phase: Phase::Plan,
+            phase: Phase::Review,
             status: "reading the change".into(),
             error: None,
             started: Instant::now(),
+            review_only: false,
         });
+        self
+    }
+
+    pub fn with_classes(mut self, classes: Option<Classes>) -> Self {
+        self.classes = classes;
         self
     }
 
@@ -711,7 +716,7 @@ impl<'a> App<'a> {
                     self.start_review();
                     return;
                 }
-                if self.planning.as_ref().is_some_and(|p| p.phase != Phase::Review) {
+                if self.planning.as_ref().is_some_and(|p| matches!(p.phase, Phase::Plan | Phase::Cover)) {
                     self.finish_tour();
                 }
                 self.end_planning();
@@ -722,24 +727,25 @@ impl<'a> App<'a> {
     }
 
     fn next_phase(&mut self, done: Phase, ok: bool) {
-        if done == Phase::Plan && ok && !self.tours[AGENT].stages.is_empty() {
-            let missing = plan::uncovered(&self.tours[AGENT], self.ws);
-            if !missing.is_empty() {
-                let msg = plan::coverage_prompt(self.ws, &missing);
-                let status = format!("grouping {} more hunks", missing.len());
-                if self.turn(&msg, Phase::Cover, status) {
-                    return;
-                }
+        let review_only = self.planning.as_ref().is_some_and(|p| p.review_only);
+        if done == Phase::Review {
+            review::save(&self.findings, self.cache.as_deref());
+        }
+        if ok && !(review_only && done == Phase::Review) {
+            let mut classes = self.classes.take().unwrap_or_default();
+            let next = plan::after(done, self.ws, &self.tours[AGENT], &self.findings, &mut classes);
+            if let plan::Next::Send(_, Phase::Plan) = &next {
+                classes.save(self.cache.as_deref());
+            }
+            self.classes = Some(classes);
+            if let plan::Next::Send(msg, phase) = next
+                && self.turn(&msg, phase, phase.status().into())
+            {
+                return;
             }
         }
-        if done != Phase::Review {
-            if !self.finish_tour() {
-                self.end_planning();
-                return;
-            }
-            if self.turn(&review::prompt(), Phase::Review, "reviewing".into()) {
-                return;
-            }
+        if matches!(done, Phase::Plan | Phase::Cover) {
+            self.finish_tour();
         }
         self.end_planning();
     }
@@ -758,8 +764,7 @@ impl<'a> App<'a> {
     }
 
     fn end_planning(&mut self) {
-        let reviewed = self.planning.take().is_some_and(|p| p.phase == Phase::Review);
-        if reviewed {
+        if self.planning.take().is_some() {
             review::save(&self.findings, self.cache.as_deref());
         }
         if let Some(q) = self.chat.pending.take() {
@@ -787,6 +792,7 @@ impl<'a> App<'a> {
             status: "reviewing".into(),
             error: None,
             started: Instant::now(),
+            review_only: true,
         });
         if !self.agent.as_mut().is_some_and(|a| a.send(&msg).is_ok()) {
             self.planning = None;
@@ -842,6 +848,13 @@ impl<'a> App<'a> {
                     }
                 }
                 plan::Parsed::Update(_) | plan::Parsed::Withdraw(_) => {}
+                plan::Parsed::Classes(cs) => {
+                    let c = self.classes.get_or_insert_default();
+                    for x in cs {
+                        c.accept(x, self.ws);
+                    }
+                }
+                plan::Parsed::Changes(changes) => self.classes.get_or_insert_default().changes = changes,
             }
         }
     }
@@ -856,7 +869,7 @@ impl<'a> App<'a> {
             ));
             return false;
         }
-        plan::complete(&mut self.tours[AGENT], self.ws);
+        plan::complete(&mut self.tours[AGENT], self.ws, self.classes.as_ref());
         self.agent_ready = true;
         plan::save(&self.tours[AGENT], self.cache.as_deref());
         self.sync_findings();
@@ -1289,11 +1302,39 @@ impl<'a> App<'a> {
             out.push(Line::from(vec![
                 Span::styled(format!(" {} ", SPIN[i]), Style::default().fg(MAUVE)),
                 Span::styled(
-                    format!("planning · {}s", p.started.elapsed().as_secs()),
+                    format!("{} · {}s", p.phase.status(), p.started.elapsed().as_secs()),
                     Style::default().fg(MAUVE),
                 ),
             ]));
             out.push(Line::from(Span::styled(format!("   {status}"), dim())));
+            if !p.review_only {
+                let at = match p.phase {
+                    Phase::Review => 0,
+                    Phase::Classify { .. } => 1,
+                    Phase::Plan | Phase::Cover => 2,
+                };
+                let open = self.findings.iter().filter(|f| !f.withdrawn).count();
+                let classified = self.classes.as_ref().map_or(0, |c| c.hunks.len());
+                let total = self.ws.manifest.hunks.len();
+                for (k, name) in [
+                    format!("review · {open} findings"),
+                    format!("classify · {classified}/{total} hunks"),
+                    "tour".to_string(),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let (mark, st) = match k.cmp(&at) {
+                        std::cmp::Ordering::Less => ("✓", Style::default().fg(GREEN)),
+                        std::cmp::Ordering::Equal => ("›", Style::default().fg(MAUVE)),
+                        std::cmp::Ordering::Greater => ("·", dim()),
+                    };
+                    out.push(Line::from(vec![
+                        Span::styled(format!("   {mark} "), st),
+                        Span::styled(name, if k > at { dim() } else { Style::default().fg(SUBTEXT) }),
+                    ]));
+                }
+            }
             if let Some(e) = &p.error {
                 out.push(Line::from(Span::styled(format!("   {e}"), Style::default().fg(RED))));
             }
