@@ -203,6 +203,7 @@ pub fn severity_style(s: Severity) -> Style {
     Style::default().fg(match s {
         Severity::Bug => RED,
         Severity::Risk => PEACH,
+        Severity::Change => BLUE,
         Severity::Question => YELLOW,
         Severity::Nit => SUBTEXT,
     })

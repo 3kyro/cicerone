@@ -97,6 +97,7 @@ pub fn compose(ws: &Workspace, findings: &[Finding], intent: &str, pr: u64) -> S
     for (s, one, many) in [
         (Severity::Bug, "bug", "bugs"),
         (Severity::Risk, "risk", "risks"),
+        (Severity::Change, "behavior change", "behavior changes"),
         (Severity::Question, "question", "questions"),
         (Severity::Nit, "nit", "nits"),
     ] {

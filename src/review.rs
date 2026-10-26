@@ -9,6 +9,7 @@ use std::path::Path;
 pub enum Severity {
     Bug,
     Risk,
+    Change,
     Question,
     Nit,
 }
@@ -18,6 +19,7 @@ impl Severity {
         match self {
             Severity::Bug => "BUG",
             Severity::Risk => "RISK",
+            Severity::Change => "CHANGE",
             Severity::Question => "QUESTION",
             Severity::Nit => "NIT",
         }
@@ -137,14 +139,41 @@ pub const TITLE: &str = "Review";
 
 /// Sent with each chat question, because a resumed session keeps the system
 /// prompt it started with.
-pub const UPDATE_RULES: &str = r#"If your answer shows that a finding is wrong, too severe, too mild, or needs a better text or anchor, also change it with one JSON object on its own line: {"finding_update":{"id":"F3","severity":"nit","title":"...","body":"...","lines":[a,b],"reason":"why"}} (only the fields that change, always a reason), or {"finding_withdraw":{"id":"F3","reason":"why"}}, or {"finding":{...}} for a new problem. Say the change in the text too. No other JSON."#;
+pub const UPDATE_RULES: &str = r#"If your answer shows that a finding is wrong, too severe, too mild, or needs a better text or anchor, also change it with one JSON object on its own line: {"finding_update":{"id":"F3","severity":"change","title":"...","body":"...","lines":[a,b],"reason":"why"}} (only the fields that change, always a reason), or {"finding_withdraw":{"id":"F3","reason":"why"}}, or {"finding":{...}} for a new problem. Say the change in the text too. No other JSON.
+If the reviewer says that a behavior change is intended, a bug or risk about it becomes "change", never "nit": the callers and users still must know about it. Use "nit" only for findings that do not touch behavior."#;
 const CONTEXT: usize = 3;
 
-pub const PROMPT: &str = r#"Now review the change as a careful senior reviewer. Report what a reviewer must act on or ask about: bugs, behavior changes that look unintended, wrong or missing error handling, security and data handling, concurrency, and missing tests for risky paths. Skip style and formatting.
+pub const SEVERITIES: &str = r#"Severities:
+- "bug": the code does the wrong thing, or fails, for an input or state that can happen.
+- "risk": the code can fail or be misused under conditions that are not certain: concurrency, error paths, security, data loss, performance at scale.
+- "change": an intended change to behavior or to a contract that callers, API users, operators, or existing data must know about: a new or changed response, a request that is now rejected, a changed default, a migration. Say who is affected and what they must do.
+- "question": the reviewer cannot tell from the code if it is right; the author must answer.
+- "nit": style, naming, or wording only, with no effect on behavior. Never use "nit" for a finding about behavior."#;
 
-Answer with JSON Lines only, one line per finding, each as soon as you have it:
-{"finding":{"severity":"bug|risk|question|nit","title":"short","body":"markdown: what is wrong, why it matters, what to do","file":"path","lines":[a,b]}}
-"lines" are head line numbers in that file and must point at the exact code. For removed code, use the head lines where it was. At most 12 findings, most severe first. Check each claim against the code before you report it. If you find nothing, answer with nothing."#;
+pub const PROMPT: &str = r#"Review the whole change as a careful senior reviewer. Read every hunk in the diff, including the hunks marked as likely mechanical: confirm that they are mechanical. Read the full files under FILES when a hunk needs context.
+
+Report what a reviewer must act on or ask about:
+- bugs, and behavior changes that look unintended;
+- intended changes to public API behavior or contracts: requests that are now accepted or rejected, changed responses, status codes, defaults, or permissions;
+- wrong or missing error handling;
+- security and data handling;
+- concurrency;
+- compatibility with existing data, stored state, and running instances, and missing migrations;
+- docs, changelogs, release notes, API descriptions, and examples that do not match the new behavior, or are missing for it;
+- version numbers that must change with the change;
+- missing tests for risky paths.
+Skip style and formatting.
+
+"#;
+
+pub const FORMAT: &str = r#"Answer with JSON Lines only, one line per finding, each as soon as you have it:
+{"finding":{"severity":"bug|risk|change|question|nit","title":"short","body":"markdown: what is wrong or what changes, why it matters, what to do","file":"path","lines":[a,b]}}
+"lines" are head line numbers in that file and must point at the exact code. For removed code, use the head lines where it was. At most 15 findings, most severe first. Check each claim against the code before you report it. If you find nothing, answer with nothing."#;
+
+/// The review turn: what to look for, the severities, and the answer format.
+pub fn prompt() -> String {
+    format!("{PROMPT}{SEVERITIES}\n\n{FORMAT}")
+}
 
 /// Keeps a finding only when it points into a changed file at lines that
 /// exist, and gives it an id.
@@ -280,6 +309,13 @@ mod tests {
         assert!(f.withdraw("covered elsewhere"));
         assert!(f.withdrawn && f.history.len() == 2);
         assert!(!f.withdraw("again"));
+    }
+
+    #[test]
+    fn a_behavior_change_ranks_above_questions_and_nits() {
+        assert!(Severity::Risk < Severity::Change && Severity::Change < Severity::Question);
+        let f: Finding = serde_json::from_str(r#"{"severity":"change","title":"t","file":"A.hs","lines":[1,1]}"#).unwrap();
+        assert_eq!(f.severity.label(), "CHANGE");
     }
 
     #[test]

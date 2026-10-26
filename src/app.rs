@@ -737,7 +737,7 @@ impl<'a> App<'a> {
                 self.end_planning();
                 return;
             }
-            if self.turn(review::PROMPT, Phase::Review, "reviewing".into()) {
+            if self.turn(&review::prompt(), Phase::Review, "reviewing".into()) {
                 return;
             }
         }
@@ -780,7 +780,7 @@ impl<'a> App<'a> {
         if self.agent.is_none() && self.start_agent().is_err() {
             return;
         }
-        let msg = self.with_primer(review::PROMPT.to_string());
+        let msg = self.with_primer(review::prompt());
         self.planning = Some(Planning {
             parser: plan::Parser::default(),
             phase: Phase::Review,

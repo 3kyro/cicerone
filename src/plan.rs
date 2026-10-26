@@ -42,10 +42,11 @@ After the plan, cicerone can send the hunks that the tour does not show yet. Ans
 CHAT
 After the plan, the reviewer can send questions. Each question names the step and the lens they are looking at, and lists the open review findings with their ids (F1, F2, ...). Answer in short markdown for a terminal: plain sentences, `code`, bullets. No headings, no tables.
 When the conversation shows that a finding is wrong, too severe, too mild, or needs a better text or anchor, change it: put one JSON object on its own line, anywhere in the answer:
-{"finding_update":{"id":"F3","severity":"nit","title":"...","body":"...","lines":[a,b],"reason":"why it changed"}} (give only the fields that change, and always a reason)
+{"finding_update":{"id":"F3","severity":"change","title":"...","body":"...","lines":[a,b],"reason":"why it changed"}} (give only the fields that change, and always a reason)
 {"finding_withdraw":{"id":"F3","reason":"why it is not a problem"}}
 {"finding":{...}} for a new problem, in the review format.
-Do this only when the evidence supports it, and say so in the text too. Never put other JSON in an answer."#;
+Do this only when the evidence supports it, and say so in the text too. Never put other JSON in an answer.
+An intended behavior change is still a finding: when the reviewer confirms that it is intended, change a bug or risk about it to "change", never to "nit"."#;
 
 const MAX_DIFF: usize = 400_000;
 
@@ -372,7 +373,7 @@ pub fn run_headless(
                 complete(&mut tour, ws);
                 save(&tour, cache);
                 eprintln!("reviewing");
-                agent.send(review::PROMPT)?;
+                agent.send(&review::prompt())?;
                 phase = Phase::Review;
             }
             Event::Exited(err) => anyhow::bail!("the agent stopped: {err}"),
