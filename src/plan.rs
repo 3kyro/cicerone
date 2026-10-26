@@ -273,6 +273,9 @@ pub fn refresh(tour: &mut Tour, ws: &Workspace, classes: Option<&Classes>) {
 /// Appends the mechanical stage and a stage for every hunk that the tour
 /// still does not show, so nothing escapes the review.
 pub fn complete(tour: &mut Tour, ws: &Workspace, classes: Option<&Classes>) {
+    if let Some(c) = classes {
+        promote_docs(tour, c);
+    }
     if !tour.stages.iter().any(|s| s.title == "Mechanical") {
         let mech = match classes {
             Some(c) => mechanical_stage(ws, c),
@@ -311,6 +314,43 @@ pub fn complete(tour: &mut Tour, ws: &Workspace, classes: Option<&Classes>) {
                 })
                 .collect(),
         });
+    }
+}
+
+/// Takes docs hunks out of groups and shows each in a lens of its own in
+/// the same step, so a page reads as a page and not as changed lines.
+fn promote_docs(tour: &mut Tour, c: &Classes) {
+    let docs = |h: &str| c.kind(h) == Some(crate::classes::Kind::Docs);
+    let lensed: BTreeSet<String> = tour
+        .stages
+        .iter()
+        .flat_map(|s| &s.steps)
+        .flat_map(|s| &s.blocks)
+        .filter_map(|b| match b {
+            Block::Lens(l) => l.hunk.clone(),
+            _ => None,
+        })
+        .collect();
+    for step in tour.stages.iter_mut().flat_map(|s| &mut s.steps) {
+        let mut blocks = Vec::with_capacity(step.blocks.len());
+        for b in std::mem::take(&mut step.blocks) {
+            let Block::Group(mut g) = b else {
+                blocks.push(b);
+                continue;
+            };
+            let (pages, rest): (Vec<String>, Vec<String>) = g.hunks.drain(..).partition(|h| docs(h));
+            blocks.extend(
+                pages
+                    .iter()
+                    .filter(|h| !lensed.contains(*h))
+                    .map(|h| Block::Lens(LensSpec::hunk(h))),
+            );
+            if !rest.is_empty() {
+                g.hunks = rest;
+                blocks.push(Block::Group(g));
+            }
+        }
+        step.blocks = blocks;
     }
 }
 
@@ -645,6 +685,50 @@ mod tests {
         let m = material(&ws);
         assert!(m.contains("+new H1") && m.contains("+new H2"));
         assert!(m.contains("@@ H2 -1,1 +1,1  likely mechanical: import or export lines only"));
+    }
+
+    #[test]
+    fn docs_hunks_leave_their_groups() {
+        use crate::classes::{Class, Kind};
+        let ws = crate::classes::tests::ws();
+        let mut c = Classes::default();
+        for (h, k) in [("H1", Kind::Docs), ("H2", Kind::Core), ("H3", Kind::Docs)] {
+            c.accept(
+                Class {
+                    hunk: h.into(),
+                    kind: k,
+                    reason: String::new(),
+                },
+                &ws,
+            );
+        }
+        let mut tour = Tour {
+            title: String::new(),
+            intent: String::new(),
+            range: None,
+            glossary: Vec::new(),
+            stages: vec![Stage {
+                title: "Docs and wiring".into(),
+                steps: vec![tour::Step {
+                    title: "s".into(),
+                    text: String::new(),
+                    blocks: vec![
+                        Block::Lens(LensSpec::hunk("H3")),
+                        Block::Group(tour::Group {
+                            title: String::new(),
+                            text: String::new(),
+                            hunks: vec!["H1".into(), "H2".into(), "H3".into()],
+                        }),
+                    ],
+                }],
+            }],
+        };
+        complete(&mut tour, &ws, Some(&c));
+        let b = &tour.stages[0].steps[0].blocks;
+        assert_eq!(b.len(), 3);
+        assert!(matches!(&b[1], Block::Lens(l) if l.hunk.as_deref() == Some("H1")));
+        assert!(matches!(&b[2], Block::Group(g) if g.hunks == ["H2"]));
+        assert_eq!(tour.stages.len(), 1, "nothing is left out");
     }
 
     #[test]
