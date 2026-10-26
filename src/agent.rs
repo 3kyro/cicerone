@@ -30,6 +30,7 @@ pub struct Options<'a> {
     pub system: &'a str,
     pub model: Option<&'a str>,
     pub log: Option<&'a Path>,
+    pub tools: Option<&'a Path>,
     pub files: Option<&'a Path>,
 }
 
@@ -62,7 +63,11 @@ impl Agent {
             .context("starting claude")?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        std::thread::spawn(move || read_events(stdout, tx));
+        let tools = o
+            .tools
+            .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+        let session = o.session.to_string();
+        std::thread::spawn(move || read_events(stdout, tx, tools, session));
         Ok(Agent { child, stdin })
     }
 
@@ -81,7 +86,22 @@ impl Drop for Agent {
     }
 }
 
-fn read_events(stdout: std::process::ChildStdout, tx: Sender<Event>) {
+/// Appends one JSON line per tool call, so a review can be checked for
+/// what the agent read.
+fn record(log: &mut Option<std::fs::File>, session: &str, msg: &Value) {
+    let Some(f) = log else { return };
+    let Some(cs) = msg["message"]["content"].as_array() else { return };
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for c in cs.iter().filter(|c| c["type"] == "tool_use") {
+        let line = json!({"time": time, "session": session, "tool": c["name"], "input": c["input"]});
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn read_events(stdout: std::process::ChildStdout, tx: Sender<Event>, mut tools: Option<std::fs::File>, session: String) {
     let mut last_error = String::new();
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
@@ -98,10 +118,13 @@ fn read_events(stdout: std::process::ChildStdout, tx: Sender<Event>) {
                     _ => None,
                 }
             }
-            Some("assistant") => v["message"]["content"]
-                .as_array()
-                .and_then(|cs| cs.iter().find(|c| c["type"] == "tool_use"))
-                .map(|c| Event::Tool(tool_summary(c))),
+            Some("assistant") => {
+                record(&mut tools, &session, &v);
+                v["message"]["content"]
+                    .as_array()
+                    .and_then(|cs| cs.iter().find(|c| c["type"] == "tool_use"))
+                    .map(|c| Event::Tool(tool_summary(c)))
+            }
             Some("result") => {
                 let ok = !v["is_error"].as_bool().unwrap_or(false);
                 if !ok {

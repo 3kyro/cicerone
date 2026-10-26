@@ -202,6 +202,7 @@ impl<'a> App<'a> {
             let _ = std::fs::write(d.join("session"), &session);
         }
         let log = self.cache.as_ref().map(|d| d.join("agent-chat.log"));
+        let tools = self.cache.as_ref().map(|d| d.join("tools.log"));
         let (tx, rx) = std::sync::mpsc::channel();
         let a = Agent::start(
             agent::Options {
@@ -211,6 +212,7 @@ impl<'a> App<'a> {
                 system: plan::SYSTEM,
                 model: cfg.model.as_deref(),
                 log: log.as_deref(),
+                tools: tools.as_deref(),
                 files: self.ws.snapshot.as_deref(),
             },
             tx,

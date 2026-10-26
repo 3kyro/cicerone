@@ -207,6 +207,7 @@ fn start_planner(
         std::fs::write(d.join("session"), &session)?;
     }
     let log = cache.map(|d| d.join("agent.log"));
+    let tools = cache.map(|d| d.join("tools.log"));
     let (tx, rx) = std::sync::mpsc::channel();
     let mut a = agent::Agent::start(
         agent::Options {
@@ -216,6 +217,7 @@ fn start_planner(
             system: plan::SYSTEM,
             model,
             log: log.as_deref(),
+            tools: tools.as_deref(),
             files: ws.snapshot.as_deref(),
         },
         tx,
