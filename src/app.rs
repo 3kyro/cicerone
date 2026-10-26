@@ -354,7 +354,8 @@ impl<'a> App<'a> {
             return;
         }
         let range = format!("{}..{}", self.ws.manifest.base, self.ws.manifest.head);
-        let msg = self.with_primer(report::prompt(&self.findings, &root, &range));
+        let changes = self.classes.as_ref().map(|c| c.changes.clone()).unwrap_or_default();
+        let msg = self.with_primer(report::prompt(&self.findings, &changes, &root, &range));
         if self.agent.as_mut().is_some_and(|a| a.send(&msg).is_ok()) {
             self.report = Some(ReportJob {
                 text: String::new(),
@@ -377,7 +378,11 @@ impl<'a> App<'a> {
                     self.notice = Some("The agent did not write a report.".into());
                     return;
                 }
-                self.publish_report(&report::clean(&job.text));
+                let mut text = report::clean(&job.text);
+                if let Some(c) = self.classes.as_ref().filter(|c| !c.hunks.is_empty()) {
+                    text.push_str(&format!("\n## Coverage\n\n{}\n", c.coverage_note(self.ws)));
+                }
+                self.publish_report(&text);
             }
             agent::Event::Exited(err) => {
                 self.report = None;
@@ -468,7 +473,7 @@ impl<'a> App<'a> {
         };
         if !path.exists() {
             let intent = self.tours[AGENT].intent.clone();
-            if let Err(e) = std::fs::write(&path, github::compose(self.ws, &self.findings, &intent, pr)) {
+            if let Err(e) = std::fs::write(&path, github::compose(self.ws, &self.findings, self.classes.as_ref(), &intent, pr)) {
                 self.notice = Some(format!("Could not write the draft: {e}"));
                 return;
             }

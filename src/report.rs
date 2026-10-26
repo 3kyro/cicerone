@@ -2,8 +2,16 @@ use crate::review::Finding;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-pub fn prompt(findings: &[Finding], root: &Path, range: &str) -> String {
+pub fn prompt(findings: &[Finding], changes: &[String], root: &Path, range: &str) -> String {
     let json = serde_json::to_string_pretty(findings).unwrap_or_default();
+    let changes = if changes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nThe distinct changes, from your classify turn. The summary must name each of them:\n{}",
+            changes.iter().map(|c| format!("- {c}\n")).collect::<String>()
+        )
+    };
     format!(
         r##"Write the final review report of this change, for another agent who will act on it (fix the code, or reply to the author) and has not seen this session. Use what you know from the tour, your review, and the chat.
 
@@ -11,15 +19,16 @@ Answer with Markdown only: no JSON lines, no code fence around the whole report.
 
 Sections:
 1. Title, then the repository path {root} and the range {range}.
-2. Summary: what the change does and why, in three to five sentences.
+2. Summary: what the change does and why, in three to five sentences, then every distinct change as a list.
 3. Verdict: approve, approve with changes, or request changes, with one line why.
 4. Findings: the open findings below, most severe first. For each one: a heading with its id, severity, and title; file and lines; what is wrong and why it matters; a concrete fix; the relevant code lines, quoted.
 5. Withdrawn findings: one line each, with the reason.
 6. Questions for the author.
 7. What you checked that looks right.
+cicerone appends a coverage section; do not write one.
 
 The findings below are the current state. They include the changes made in the chat:
-{json}"##,
+{json}{changes}"##,
         root = root.display()
     )
 }

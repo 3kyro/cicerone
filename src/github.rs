@@ -1,3 +1,4 @@
+use crate::classes::Classes;
 use crate::manifest::Workspace;
 use crate::review::{Finding, Severity};
 use anyhow::{Context, Result, bail};
@@ -77,7 +78,7 @@ fn heading(f: &Finding) -> String {
 
 /// The editable review: a header that sets identity and event, the summary
 /// body, then one section per inline comment.
-pub fn compose(ws: &Workspace, findings: &[Finding], intent: &str, pr: u64) -> String {
+pub fn compose(ws: &Workspace, findings: &[Finding], classes: Option<&Classes>, intent: &str, pr: u64) -> String {
     let ranges = diff_lines(ws);
     let open: Vec<&Finding> = {
         let mut v: Vec<&Finding> = findings.iter().filter(|f| !f.withdrawn).collect();
@@ -122,11 +123,17 @@ pub fn compose(ws: &Workspace, findings: &[Finding], intent: &str, pr: u64) -> S
     if !intent.trim().is_empty() {
         let _ = writeln!(s, "{}\n", intent.trim());
     }
+    if let Some(c) = classes.filter(|c| !c.changes.is_empty()) {
+        let _ = writeln!(s, "Changes in this PR:\n{}", c.changes_list());
+    }
     if !counts.is_empty() {
         let _ = writeln!(s, "Findings: {}.", counts.join(", "));
     }
     for f in &general {
         let _ = writeln!(s, "\n{} (`{}:{}-{}`)\n\n{}", heading(f), f.file, f.lines.0, f.lines.1, f.body.trim());
+    }
+    if let Some(c) = classes.filter(|c| !c.hunks.is_empty()) {
+        let _ = writeln!(s, "\n---\n\n{}", c.coverage_note(ws));
     }
     for (f, (a, b)) in inline {
         let place = if a == b { format!("{a}") } else { format!("{a}-{b}") };
@@ -375,7 +382,25 @@ mod tests {
             finding("F2", Severity::Risk, (40, 41), false),
             finding("F3", Severity::Bug, (11, 11), true),
         ];
-        let text = compose(&ws, &fs, "Locks the bundle.", 7);
+        let mut classes = Classes {
+            changes: vec!["Locks the bundle.".into(), "Bumps the version.".into()],
+            hunks: Vec::new(),
+        };
+        let text = compose(&ws, &fs, None, "Locks the bundle.", 7);
+        assert!(!text.contains("Coverage") && !text.contains("Changes in this PR"));
+        for h in &ws.manifest.hunks {
+            classes.accept(
+                crate::classes::Class {
+                    hunk: h.id.clone(),
+                    kind: crate::classes::Kind::Core,
+                    reason: String::new(),
+                },
+                &ws,
+            );
+        }
+        let with = compose(&ws, &fs, Some(&classes), "Locks the bundle.", 7);
+        assert!(with.contains("Changes in this PR:\n- Locks the bundle.\n- Bumps the version.\n"));
+        assert!(with.contains("**Coverage.** The review covered all"));
         let d = parse(&text).unwrap().unwrap();
         assert_eq!((d.identity, d.event), (Identity::Claude, Event::Comment));
         assert!(d.body.contains("Locks the bundle.") && d.body.contains("1 risk, 1 nit"));

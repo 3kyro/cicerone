@@ -81,6 +81,8 @@ pub struct Classes {
     pub hunks: Vec<Class>,
 }
 
+const NOT_CLASSIFIED: &str = "not classified by the agent";
+
 pub const PROMPT: &str = r#"Now classify every hunk of the diff, from your review. Kinds:
 - "core": the change that the PR is for.
 - "supporting": new or changed code that the core change needs: types, helpers, queries.
@@ -132,8 +134,8 @@ impl Classes {
             .missing(ws)
             .into_iter()
             .map(|h| match &h.mechanical {
-                Some(m) => (h.id.clone(), Kind::Mechanical, format!("not classified by the agent; {}", hint(ws, m))),
-                None => (h.id.clone(), Kind::Supporting, "not classified by the agent".into()),
+                Some(m) => (h.id.clone(), Kind::Mechanical, format!("{NOT_CLASSIFIED}; {}", hint(ws, m))),
+                None => (h.id.clone(), Kind::Supporting, NOT_CLASSIFIED.into()),
             })
             .collect();
         for (hunk, kind, reason) in missing {
@@ -145,6 +147,51 @@ impl Classes {
     fn sort(&mut self, ws: &Workspace) {
         let pos = |id: &str| ws.manifest.hunks.iter().position(|h| h.id == id).unwrap_or(usize::MAX);
         self.hunks.sort_by_key(|c| pos(&c.hunk));
+    }
+
+    /// What the review covered, for the readers of the posted review and
+    /// of the report.
+    pub fn coverage_note(&self, ws: &Workspace) -> String {
+        let counts: Vec<String> = Kind::ALL
+            .iter()
+            .filter_map(|&k| {
+                let n = self.count(k);
+                (n > 0).then(|| format!("{n} {}", k.label()))
+            })
+            .collect();
+        let mut s = format!(
+            "**Coverage.** The review covered all {} hunks in {} files: {}.",
+            ws.manifest.hunks.len(),
+            ws.manifest.files.len(),
+            counts.join(", ")
+        );
+        let guessed = self.hunks.iter().filter(|c| c.reason.starts_with(NOT_CLASSIFIED)).count();
+        if guessed > 0 {
+            let _ = write!(s, " The agent gave no class to {guessed} of them; they use the class of a syntax detector.");
+        }
+        let groups = self.mechanical_groups();
+        if !groups.is_empty() {
+            s.push_str("\n\nMechanical hunks, checked to have no effect on behavior:");
+            for (reason, hunks) in groups {
+                let mut files: Vec<&str> = Vec::new();
+                for f in hunks.iter().filter_map(|h| ws.hunk(h)).map(|h| h.file.as_str()) {
+                    if !files.contains(&f) {
+                        files.push(f);
+                    }
+                }
+                let shown: Vec<String> = files.iter().take(4).map(|f| format!("`{}`", crate::tour::short(f))).collect();
+                let more = if files.len() > 4 { format!(" and {} more files", files.len() - 4) } else { String::new() };
+                let reason = if reason.is_empty() { "mechanical" } else { reason.as_str() };
+                let n = hunks.len();
+                let _ = write!(s, "\n- {reason}: {n} hunk{} in {}{more}", if n == 1 { "" } else { "s" }, shown.join(", "));
+            }
+        }
+        s
+    }
+
+    /// The distinct changes as a Markdown list.
+    pub fn changes_list(&self) -> String {
+        self.changes.iter().map(|c| format!("- {}\n", c.trim())).collect()
     }
 
     pub fn count(&self, kind: Kind) -> usize {
@@ -282,5 +329,9 @@ pub(crate) mod tests {
         c.fill_missing(&ws);
         let got: Vec<(&str, Kind)> = c.hunks.iter().map(|x| (x.hunk.as_str(), x.kind)).collect();
         assert_eq!(got, vec![("H1", Kind::Supporting), ("H2", Kind::Mechanical), ("H3", Kind::Core)]);
+        let note = c.coverage_note(&ws);
+        assert!(note.contains("all 3 hunks in 0 files: 1 core, 1 supporting, 1 mechanical."), "{note}");
+        assert!(note.contains("no class to 2 of them"));
+        assert!(note.contains("- not classified by the agent; import or export lines only: 1 hunk in `A.hs`"), "{note}");
     }
 }
