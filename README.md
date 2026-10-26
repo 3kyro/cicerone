@@ -154,3 +154,7 @@ Then, in Claude Code:
 ```
 
 The skill needs kitty with remote control on (`allow_remote_control yes`). For `E`, it also needs Claude Code cross-session messaging (`/status` shows a `Peer address` row). Without kitty, the skill gives you the command to run in another terminal.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
