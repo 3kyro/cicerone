@@ -45,8 +45,6 @@ pub struct Class {
     pub reason: String,
 }
 
-/// One classification line from the agent: one hunk, or several hunks
-/// with the same kind and reason.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Line {
     #[serde(default)]
@@ -74,7 +72,6 @@ impl Line {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Classes {
-    /// Every distinct change in the diff, one sentence each.
     #[serde(default)]
     pub changes: Vec<String>,
     #[serde(default)]
@@ -111,8 +108,6 @@ impl Classes {
         self.kind(hunk) == Some(Kind::Mechanical)
     }
 
-    /// Keeps `c` when its hunk exists. A later class of the same hunk
-    /// replaces the earlier one.
     pub fn accept(&mut self, mut c: Class, ws: &Workspace) -> bool {
         let Some(h) = ws.hunk(c.hunk.trim()) else {
             return false;
@@ -127,8 +122,6 @@ impl Classes {
         ws.manifest.hunks.iter().filter(|h| self.of(&h.id).is_none()).collect()
     }
 
-    /// Gives each hunk the agent left out a class from the detector, and
-    /// says so in the reason.
     pub fn fill_missing(&mut self, ws: &Workspace) {
         let missing: Vec<(String, Kind, String)> = self
             .missing(ws)
@@ -149,8 +142,6 @@ impl Classes {
         self.hunks.sort_by_key(|c| pos(&c.hunk));
     }
 
-    /// What the review covered, for the readers of the posted review and
-    /// of the report.
     pub fn coverage_note(&self, ws: &Workspace) -> String {
         let counts: Vec<String> = Kind::ALL
             .iter()
@@ -189,7 +180,6 @@ impl Classes {
         s
     }
 
-    /// The distinct changes as a Markdown list.
     pub fn changes_list(&self) -> String {
         self.changes.iter().map(|c| format!("- {}\n", c.trim())).collect()
     }
@@ -198,7 +188,6 @@ impl Classes {
         self.hunks.iter().filter(|c| c.kind == kind).count()
     }
 
-    /// The mechanical hunks, grouped by reason, in diff order.
     pub fn mechanical_groups(&self) -> Vec<(String, Vec<String>)> {
         let mut out: Vec<(String, Vec<String>)> = Vec::new();
         for c in self.hunks.iter().filter(|c| c.kind == Kind::Mechanical) {
@@ -238,7 +227,6 @@ pub fn retry_prompt(missing: &[&HunkEntry]) -> String {
     s
 }
 
-/// What the detector saw in a hunk, for the agent to confirm.
 pub fn hint(ws: &Workspace, m: &Mechanical) -> String {
     match m {
         Mechanical::Generated => "generated file".into(),

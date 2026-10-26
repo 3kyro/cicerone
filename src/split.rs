@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-/// A diff larger than this goes to helper sessions in parts.
 pub const WHOLE: usize = 400_000;
 const PART: usize = 150_000;
 const PARALLEL: usize = 4;
@@ -26,9 +25,7 @@ pub fn size(ws: &Workspace) -> usize {
         .sum()
 }
 
-/// The changed files in parts that each fit one session, or `None` when
-/// the whole diff fits. Files keep their order, so a directory tends to
-/// stay in one part.
+/// Files keep their order, so a directory tends to stay in one part.
 pub fn parts(ws: &Workspace) -> Option<Vec<Vec<String>>> {
     let (whole, part) = limits();
     if size(ws) <= whole {
@@ -91,8 +88,6 @@ fn part_prompt(ws: &Workspace, files: &[String], n: usize, total: usize) -> Stri
     s
 }
 
-/// The first turn of the main session for a split change: a short view of
-/// every hunk, and the helpers' findings to check.
 pub fn merge_prompt(ws: &Workspace, parts: usize, findings: &[String], failed: &[String]) -> String {
     let mut s = format!(
         "REVIEW of the change {}..{}.\n\nThe change is too large for one session. {parts} helper sessions reviewed it in parts.\n\n",
@@ -169,8 +164,6 @@ pub struct Options {
     pub tools: Option<PathBuf>,
 }
 
-/// Runs one helper session per part, at most a few at once, and streams
-/// their findings as JSON lines.
 pub fn start(ws: &Workspace, parts: &[Vec<String>], o: Options) -> Receiver<Msg> {
     let (tx, rx) = std::sync::mpsc::channel();
     let total = parts.len();

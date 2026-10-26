@@ -170,7 +170,6 @@ pub const FORMAT: &str = r#"Answer with JSON Lines only, one line per finding, e
 {"finding":{"severity":"bug|risk|change|question|nit","title":"short","body":"markdown: what is wrong or what changes, why it matters, what to do","file":"path","lines":[a,b]}}
 "lines" are head line numbers in that file and must point at the exact code. For removed code, use the head lines where it was. At most 15 findings, most severe first. Check each claim against the code before you report it. If you find nothing, answer with nothing."#;
 
-/// The review turn: what to look for, the severities, and the answer format.
 pub fn prompt() -> String {
     format!("{PROMPT}{SEVERITIES}\n\n{FORMAT}")
 }

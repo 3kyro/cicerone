@@ -201,8 +201,6 @@ impl<'a> App<'a> {
         self
     }
 
-    /// Collects the helpers' reviews; when the last part is done, the main
-    /// session checks and merges them.
     fn pump_helpers(&mut self) {
         let Some(p) = &mut self.planning else { return };
         let Some(h) = &mut p.helpers else { return };

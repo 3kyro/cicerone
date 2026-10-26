@@ -501,8 +501,7 @@ fn fold(
     out
 }
 
-/// For each row, whether a hole folds it. A removed row belongs to the
-/// head line that follows it.
+/// A removed row belongs to the head line that follows it.
 fn in_holes(rows: &[&URow], holes: &[HoleLabel]) -> Vec<bool> {
     let ranges: Vec<(usize, usize)> = holes
         .iter()

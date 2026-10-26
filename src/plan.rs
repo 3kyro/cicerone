@@ -62,7 +62,6 @@ An intended behavior change is still a finding: when the reviewer confirms that 
 
 const MAX_DIFF: usize = crate::split::WHOLE;
 
-/// The first turn: the whole change, and the review request.
 pub fn prompt(ws: &Workspace) -> String {
     format!(
         "REVIEW of the change {}..{}.\n\n{}\n\n{}",
@@ -355,8 +354,6 @@ fn promote_docs(tour: &mut Tour, c: &Classes) {
     }
 }
 
-/// The hunks the agent classified mechanical: the detector's patterns
-/// that cover them, then the rest grouped by the agent's reason.
 fn mechanical_stage(ws: &Workspace, c: &Classes) -> Option<Stage> {
     let mut steps = Vec::new();
     let mut shown = BTreeSet::new();
@@ -454,7 +451,6 @@ pub fn save(tour: &Tour, cache: Option<&std::path::Path>) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-    /// Helper sessions review a large change in parts.
     Split,
     Review,
     Classify { retried: bool },
