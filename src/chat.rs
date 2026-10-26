@@ -3,6 +3,7 @@ use crate::view;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -178,27 +179,35 @@ impl Chat {
             return vec![Line::from(vec![Span::styled("› ", prompt), cursor, Span::styled(hint, dim())])];
         }
         let room = w.saturating_sub(3).max(1);
-        let mut rows: Vec<String> = vec![String::new()];
-        for word in self.input.split_inclusive(' ') {
-            let mut word: Vec<char> = word.chars().collect();
-            while !word.is_empty() {
+        let mut rows: Vec<(String, usize)> = vec![(String::new(), 0)];
+        for piece in self.input.split_inclusive(' ') {
+            let pw = piece.width();
+            let used = rows.last().map_or(0, |r| r.1);
+            if used + pw <= room {
                 let row = rows.last_mut().unwrap();
-                let used = row.chars().count();
-                let fits = room.saturating_sub(used);
-                if word.len() <= fits || word.iter().all(|c| *c == ' ') {
-                    row.extend(word.drain(..));
-                } else if used > 0 && word.len() <= room {
-                    rows.push(String::new());
-                } else {
-                    let take = fits.max(1).min(word.len());
-                    row.extend(word.drain(..take));
-                    rows.push(String::new());
+                row.0.push_str(piece);
+                row.1 += pw;
+            } else if piece.trim().is_empty() {
+                rows.push((String::new(), 0));
+            } else if used > 0 && pw <= room {
+                rows.push((piece.to_string(), pw));
+            } else {
+                for c in piece.chars() {
+                    let cw = c.width().unwrap_or(0);
+                    let row = rows.last_mut().unwrap();
+                    if row.1 + cw > room && row.1 > 0 {
+                        rows.push((c.to_string(), cw));
+                    } else {
+                        row.0.push(c);
+                        row.1 += cw;
+                    }
                 }
             }
         }
-        if rows.len() > 1 && rows.last().is_some_and(String::is_empty) {
+        if rows.len() > 1 && rows.last().is_some_and(|r| r.0.is_empty()) {
             rows.pop();
         }
+        let rows: Vec<String> = rows.into_iter().map(|r| r.0).collect();
         let last = rows.len() - 1;
         rows.into_iter()
             .enumerate()
@@ -258,6 +267,9 @@ mod tests {
         };
         assert_eq!(render("abcdefgh", 6), vec!["› abc", "  def", "  gh▍"]);
         assert_eq!(render("why does it log", 10), vec!["› why ", "  does ", "  it log▍"]);
+        assert_eq!(render("abcdef    ", 10), vec!["› abcdef ", "    ▍"], "spaces past the edge wrap");
+        assert_eq!(render("abcdef    x", 10), vec!["› abcdef ", "    x▍"]);
+        assert_eq!(render("日本語テキスト", 10), vec!["› 日本語", "  テキス", "  ト▍"], "wide characters take two columns");
     }
 
     #[test]
