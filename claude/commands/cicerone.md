@@ -1,6 +1,6 @@
 Open cicerone — the guided diff-review tool — in a new kitty tab wired to this Claude Code session.
 
-The tab runs `cicerone review <range>`: a staged tour of the change (map, vocabulary, shapes, skeletons, full code, mechanical patterns). An agent plans the tour on first open (cached per range; the automatic tour shows meanwhile), then reviews the change: findings show inline in the steps that show their lines (`]`/`[` jump between them) and in a closing Review stage. `c`/`a` open a chat with that same agent session. The agent only has Read/Grep/Glob — no shell, no MCP servers.
+The tab runs `cicerone review <range>`: a staged tour of the change (map, vocabulary, shapes, skeletons, full code, mechanical patterns). On first open, an agent reviews every hunk, classifies each one, and then plans the tour from its review (cached per range; the automatic tour shows meanwhile). Findings show inline in the steps that show their lines (`]`/`[` jump between them) and in a closing Review stage. `c`/`a` open a chat with that same agent session. The agent only has Read/Grep/Glob — no shell, no MCP servers.
 
 ## Arguments
 

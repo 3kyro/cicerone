@@ -1,6 +1,6 @@
 # cicerone
 
-cicerone is a terminal tool for code review. It walks you through a change in stages, from the wide view to the details. An agent plans the tour and reviews the change. A chat box keeps one Claude session for the whole review.
+cicerone is a terminal tool for code review. It walks you through a change in stages, from the wide view to the details. An agent reviews the whole change first, then plans the tour from its review. A chat box keeps one Claude session for the whole review.
 
 cicerone shows the code at five zoom levels:
 
@@ -14,7 +14,7 @@ cicerone shows the code at five zoom levels:
 
 The tour shows names before their uses. Mechanical changes (formatting, imports, generated files, and repeated substitutions) go into one stage that you can skim. Tests come late.
 
-Haskell and Elm get syntax highlighting and structure. Other languages show as plain diffs.
+Haskell and Elm get syntax highlighting, and their signature and skeleton levels come from the syntax tree. For other languages, the agent zooms a file with labeled holes: the skeleton level folds each hole, and `+` opens it.
 
 ## Install
 
@@ -59,10 +59,25 @@ Other commands:
 
 ### What happens when you open a review
 
-1. cicerone shows the automatic tour at once.
-2. The agent plans its own tour. When the plan is ready, the agent tour replaces the automatic tour. Press `A` to switch between them.
-3. The agent adds the hunks that its tour left out.
-4. The agent reviews the change. Each finding shows in the steps that show its lines, and in a closing Review stage.
+1. cicerone shows the automatic tour at once, so you can start to read while the agent works. The rail on the left shows each phase of the agent.
+2. **Review.** The agent reviews every hunk of the change. A syntax detector marks some hunks as "likely mechanical", but that is only a hint: the agent must check those hunks too.
+3. **Classify.** The agent gives every hunk one class with a reason: core, supporting, wiring, docs, tests, or mechanical. It also lists every distinct change. cicerone checks that every hunk has a class, and asks again for the missing ones.
+4. **Plan.** The agent plans its tour from its review and its classes. When the first stage is ready, the agent tour replaces the automatic tour. Press `A` to switch between them.
+5. **Cover.** The agent places the hunks that its tour left out. Mechanical hunks go into a closing stage, grouped by the agent's reason.
+
+Each finding shows in the first step that shows its lines, and in a closing Review stage.
+
+If the diff is larger than 400 KB, cicerone splits it by file into parts. Up to four helper sessions review the parts at the same time. The main session then checks their findings, removes duplicates, adds the findings that cross parts, and goes on to classify and plan.
+
+### Severities
+
+| Severity | Meaning |
+|---|---|
+| `BUG` | The code does the wrong thing for an input or state that can happen. |
+| `RISK` | The code can fail under conditions that are not certain: concurrency, error paths, security, data loss, scale. |
+| `CHANGE` | An intended change to behavior or to a contract that callers, API users, or existing data must know about. |
+| `QUESTION` | The code does not show if it is right. The author must answer. |
+| `NIT` | Style, naming, or wording only, with no effect on behavior. |
 
 ### Keys
 
@@ -100,11 +115,13 @@ In the chat:
 
 ### The chat and the findings
 
-The chat uses the same agent session that planned and reviewed the change. If an answer shows that a finding is wrong, the agent changes it, withdraws it, or adds a new one. Each finding keeps a history of its earlier states, with the reason for each change.
+The chat uses the same agent session that reviewed the change and planned the tour. If an answer shows that a finding is wrong, the agent changes it, withdraws it, or adds a new one. Each finding keeps a history of its earlier states, with the reason for each change.
+
+If you tell the agent that a behavior change is intended, the finding becomes `CHANGE`, not `NIT`. The readers of the review still must know about the change.
 
 ### Report (`E`)
 
-The agent writes a Markdown report of the review, for another agent to act on. cicerone saves it as `report.md` in the cache. If a Claude Code session opened cicerone (see the skill below), cicerone sends that session a request to publish the report as a claude.ai Artifact page.
+The agent writes a Markdown report of the review, for another agent to act on. The report names every distinct change, and cicerone adds the coverage note (see below). cicerone saves it as `report.md` in the cache. If a Claude Code session opened cicerone (see the skill below), cicerone sends that session a request to publish the report as a claude.ai Artifact page.
 
 ### Post to GitHub (`S`)
 
@@ -112,14 +129,16 @@ The agent writes a Markdown report of the review, for another agent to act on. c
 
 - `as: claude` or `as: me`. With `as: claude`, the review and each comment start with "🤖 **Claude:**" and a note that Claude wrote it. The review still posts from your `gh` account, because GitHub does not let a local tool post as the Claude app.
 - `event: comment`, `approve`, or `request_changes`.
-- A `=== body` section for the review text.
+- A `=== body` section for the review text. It lists every distinct change and ends with a coverage note: how many hunks and files the review covered, the count per class, and the mechanical hunks with their reasons and files.
 - One `=== comment path:a-b` section for each line comment. Each comment must stay inside one hunk.
 
 Save and close the editor to post. To cancel, delete all the text. To test the flow without posting, set `CICERONE_POST_DRY_RUN=1`. cicerone then writes `github-payload.json` to the cache and does not post.
 
 ## The agent
 
-The agent is `claude -p` in one long session. It has only the `Read`, `Grep`, and `Glob` tools, and it reads a snapshot of the changed files. It has no shell and no MCP servers, and project hooks do not run.
+The agent is `claude -p` in one long session. It has only the `Read`, `Grep`, and `Glob` tools, and it reads a snapshot of the changed files. It has no shell and no MCP servers, and project hooks do not run. The helper sessions for a large diff have the same limits.
+
+cicerone records each tool call of the agent in `tools.log`, so you can see what the agent read.
 
 ## Cache
 
@@ -129,6 +148,8 @@ cicerone keeps each review in `~/.cache/cicerone/<repo>-<base>-<head>/` (or unde
 |---|---|
 | `tour.json` | The agent tour |
 | `review.json` | The findings and their history |
+| `classes.json` | The class of each hunk, and the list of changes |
+| `tools.log` | Each tool call of the agent, one JSON line each |
 | `chat.json` | The chat |
 | `session` | The agent session id |
 | `report.md` | The last report |
