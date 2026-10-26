@@ -16,7 +16,7 @@ The tab runs `cicerone review <range>`: a staged tour of the change (map, vocabu
 
 ## Steps
 
-1. If `cicerone` is not on PATH, install it with `cargo install -q --path ~/repos/cicerone`.
+1. If `cicerone` is not on PATH, install it with `cargo install -q --git https://github.com/3kyro/cicerone`.
 2. If `$CLAUDE_CODE_MESSAGING_SOCKET` is empty, this session cannot receive messages. Say so in one line and continue. Only `E` (report) needs it: without it, cicerone saves the report but cannot ask this session to publish it.
 3. Open the tab as a plain shell tab and type the command into it, so the shell loads the usual rc files and survives cicerone exiting:
    ```sh

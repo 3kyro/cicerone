@@ -21,8 +21,10 @@ Haskell and Elm get syntax highlighting and structure. Other languages show as p
 You need Rust (edition 2024), `git`, and the `claude` CLI on `PATH`. For `S` (post to GitHub), you also need `gh`.
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/3kyro/cicerone
 ```
+
+From a clone, run `cargo install --path .` instead.
 
 ## Use
 
@@ -138,11 +140,21 @@ If you open a range that resolves to the same two commits again, cicerone loads 
 
 The `/cicerone` command opens cicerone in a new [kitty](https://sw.kovidgoyal.net/kitty/) tab, connected to the Claude Code session that runs it. The command file is [`claude/commands/cicerone.md`](claude/commands/cicerone.md).
 
-To install it, link it into your Claude Code commands:
+To install it, download it into your Claude Code commands:
+
+```sh
+mkdir -p ~/.claude/commands
+curl -fsSL https://raw.githubusercontent.com/3kyro/cicerone/main/claude/commands/cicerone.md \
+  -o ~/.claude/commands/cicerone.md
+```
+
+From a clone, you can link it instead, so that it updates with `git pull`:
 
 ```sh
 ln -s "$PWD/claude/commands/cicerone.md" ~/.claude/commands/cicerone.md
 ```
+
+If `cicerone` is not on `PATH`, the skill installs it from GitHub the first time that you run it.
 
 Then, in Claude Code:
 
