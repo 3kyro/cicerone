@@ -63,6 +63,7 @@ pub struct App<'a> {
     root: PathBuf,
     pr: Option<u64>,
     compose: bool,
+    scratch: Option<PathBuf>,
     chat: Chat,
     config: Option<AgentConfig>,
     needs_primer: bool,
@@ -119,6 +120,7 @@ impl<'a> App<'a> {
             root: PathBuf::new(),
             pr: None,
             compose: false,
+            scratch: None,
             chat: Chat::default(),
             config: None,
             needs_primer: false,
@@ -412,11 +414,21 @@ impl<'a> App<'a> {
         });
     }
 
-    fn draft_path(&self) -> PathBuf {
-        match &self.cache {
-            Some(d) => d.join("github-review.md"),
-            None => std::env::temp_dir().join(format!("cicerone-github-review-{}.md", std::process::id())),
+    /// The cache, or else a private directory made for this run.
+    fn draft_path(&mut self) -> std::io::Result<PathBuf> {
+        if let Some(d) = &self.cache {
+            std::fs::create_dir_all(d)?;
+            return Ok(d.join("github-review.md"));
         }
+        if self.scratch.is_none() {
+            let dir = tempfile::Builder::new()
+                .prefix("cicerone-github-")
+                .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .tempdir()?
+                .keep();
+            self.scratch = Some(dir);
+        }
+        Ok(self.scratch.as_ref().unwrap().join("github-review.md"))
     }
 
     /// Opens the GitHub review in the editor, then posts what the user saved.
@@ -442,7 +454,13 @@ impl<'a> App<'a> {
             return;
         };
         self.pr = Some(pr);
-        let path = self.draft_path();
+        let path = match self.draft_path() {
+            Ok(p) => p,
+            Err(e) => {
+                self.notice = Some(format!("Could not make a place for the draft: {e}"));
+                return;
+            }
+        };
         if !path.exists() {
             let intent = self.tours[AGENT].intent.clone();
             if let Err(e) = std::fs::write(&path, github::compose(self.ws, &self.findings, &intent, pr)) {
