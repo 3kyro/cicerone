@@ -69,7 +69,7 @@ pub struct App<'a> {
     root: PathBuf,
     pr: Option<u64>,
     compose: bool,
-    scratch: Option<PathBuf>,
+    scratch: Option<tempfile::TempDir>,
     chat: Chat,
     config: Option<AgentConfig>,
     needs_primer: bool,
@@ -484,11 +484,10 @@ impl<'a> App<'a> {
             let dir = tempfile::Builder::new()
                 .prefix("cicerone-github-")
                 .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-                .tempdir()?
-                .keep();
+                .tempdir()?;
             self.scratch = Some(dir);
         }
-        Ok(self.scratch.as_ref().unwrap().join("github-review.md"))
+        Ok(self.scratch.as_ref().unwrap().path().join("github-review.md"))
     }
 
     /// Opens the GitHub review in the editor, then posts what the user saved.
