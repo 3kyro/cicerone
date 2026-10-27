@@ -1,14 +1,17 @@
 use crate::diff::Hunk;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "pattern")]
+#[serde(rename_all = "snake_case", tag = "kind", content = "of")]
 pub enum Mechanical {
     Generated,
     Formatting,
     Imports,
     Pattern(String),
+    /// The other hunks that hold the same lines. Empty when the code moved
+    /// inside one hunk.
+    Moved(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -45,21 +48,31 @@ pub struct Input<'a> {
 pub struct Analysis {
     pub kinds: BTreeMap<String, Mechanical>,
     pub patterns: Vec<Pattern>,
+    pub partly_moved: BTreeMap<String, Vec<String>>,
 }
 
 const MIN_HUNKS: usize = 2;
 const MIN_HUNKS_ONE_SIDED: usize = 3;
 const MIN_STATEMENT_WORDS: usize = 3;
+const MIN_MOVED_LINES: usize = 2;
+const MIN_MOVED_WORDS: usize = 4;
+const MIN_PARTLY_MOVED_LINES: usize = 4;
+const MIN_PARTLY_MOVED_WORDS: usize = 12;
 
 type Subs = Option<Vec<(Substitution, usize)>>;
 
 pub fn analyse(inputs: &[Input]) -> Analysis {
     let mut kinds: BTreeMap<String, Mechanical> = BTreeMap::new();
+    let rest: Vec<usize> = (0..inputs.len()).filter(|&i| !inputs[i].generated).collect();
+    let (moved, partly) = moves(inputs, &rest);
+    let ids = |hs: &BTreeSet<usize>| -> Vec<String> { hs.iter().map(|&o| inputs[o].hunk.id.clone()).collect() };
     let mut subs: Vec<(usize, Subs)> = Vec::new();
     for (i, inp) in inputs.iter().enumerate() {
         let id = inp.hunk.id.clone();
         if inp.generated {
             kinds.insert(id, Mechanical::Generated);
+        } else if let Some(others) = moved.get(&i) {
+            kinds.insert(id, Mechanical::Moved(ids(others)));
         } else if is_formatting(inp.hunk) {
             kinds.insert(id, Mechanical::Formatting);
         } else {
@@ -109,7 +122,124 @@ pub fn analyse(inputs: &[Input]) -> Analysis {
             kinds.insert(inp.hunk.id.clone(), Mechanical::Imports);
         }
     }
-    Analysis { kinds, patterns }
+    let partly_moved = partly
+        .iter()
+        .filter(|(i, _)| !kinds.contains_key(&inputs[**i].hunk.id))
+        .map(|(i, hs)| (inputs[*i].hunk.id.clone(), ids(hs)))
+        .collect();
+    Analysis {
+        kinds,
+        patterns,
+        partly_moved,
+    }
+}
+
+struct Run {
+    hunk: usize,
+    removed: bool,
+    start: usize,
+    end: usize,
+    lines: Vec<String>,
+}
+
+/// Hunks whose every changed line, up to whitespace, comes back on the other
+/// side of the diff, and hunks where only some lines do, each with the other
+/// hunks that hold those lines. A run must match whole and be long enough
+/// that short lines like `}` or `else` do not match by chance, and match in
+/// one place only. A partly moved hunk needs a longer run, because a short
+/// run that matches is only noise next to the other changes. A run never
+/// matches the run next to it: that is the same code with new indentation.
+type Moves = BTreeMap<usize, BTreeSet<usize>>;
+
+fn moves(inputs: &[Input], hunks: &[usize]) -> (Moves, Moves) {
+    let mut runs: Vec<Run> = Vec::new();
+    for &i in hunks {
+        let mut cur: Option<Run> = None;
+        for (n, l) in inputs[i].hunk.lines.iter().enumerate() {
+            let removed = match l.chars().next() {
+                Some('-') => true,
+                Some('+') => false,
+                _ => {
+                    runs.extend(cur.take());
+                    continue;
+                }
+            };
+            if cur.as_ref().is_some_and(|r| r.removed != removed) {
+                runs.extend(cur.take());
+            }
+            let line = crate::syntax::normalize(&l[1..]);
+            let r = cur.get_or_insert(Run {
+                hunk: i,
+                removed,
+                start: n,
+                end: n,
+                lines: Vec::new(),
+            });
+            r.end = n + 1;
+            if !line.is_empty() {
+                r.lines.push(line);
+            }
+        }
+        runs.extend(cur);
+    }
+    runs.retain(|r| !r.lines.is_empty());
+
+    let mut at: HashMap<(bool, &str), Vec<(usize, usize)>> = HashMap::new();
+    for (k, r) in runs.iter().enumerate() {
+        for (p, l) in r.lines.iter().enumerate() {
+            at.entry((r.removed, l.as_str())).or_default().push((k, p));
+        }
+    }
+    let mut covered: Vec<Vec<bool>> = runs.iter().map(|r| vec![false; r.lines.len()]).collect();
+    let mut pairs: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    let mut long: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for (k, r) in runs.iter().enumerate() {
+        let wordy = r.lines.iter().filter(|l| l.chars().any(char::is_alphanumeric)).count();
+        let words: usize = r
+            .lines
+            .iter()
+            .map(|l| l.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).count())
+            .sum();
+        if wordy < MIN_MOVED_LINES || words < MIN_MOVED_WORDS {
+            continue;
+        }
+        let n = r.lines.len();
+        let next_to = |o: usize| runs[o].hunk == r.hunk && (runs[o].end == r.start || r.end == runs[o].start);
+        let hits: Vec<&(usize, usize)> = at
+            .get(&(!r.removed, r.lines[0].as_str()))
+            .into_iter()
+            .flatten()
+            .filter(|&&(o, p)| !next_to(o) && runs[o].lines.get(p..p + n).is_some_and(|w| w == r.lines.as_slice()))
+            .collect();
+        if let [&(o, p)] = hits[..] {
+            covered[k].fill(true);
+            covered[o][p..p + n].fill(true);
+            pairs.entry(r.hunk).or_default().insert(runs[o].hunk);
+            pairs.entry(runs[o].hunk).or_default().insert(r.hunk);
+            if wordy >= MIN_PARTLY_MOVED_LINES && words >= MIN_PARTLY_MOVED_WORDS {
+                long.entry(r.hunk).or_default().insert(runs[o].hunk);
+                long.entry(runs[o].hunk).or_default().insert(r.hunk);
+            }
+        }
+    }
+    let (mut full, mut partly) = (BTreeMap::new(), BTreeMap::new());
+    for (i, mut others) in pairs {
+        let all = runs
+            .iter()
+            .zip(&covered)
+            .filter(|(r, _)| r.hunk == i)
+            .all(|(_, c)| c.iter().all(|&x| x));
+        others.remove(&i);
+        if all {
+            full.insert(i, others);
+        } else if let Some(mut others) = long.remove(&i) {
+            others.remove(&i);
+            if !others.is_empty() {
+                partly.insert(i, others);
+            }
+        }
+    }
+    (full, partly)
 }
 
 /// Patterns over the `frequent` substitutions, and for each hunk that they
@@ -462,6 +592,61 @@ mod tests {
         assert_eq!(a.kinds.get("H5"), Some(&Mechanical::Formatting));
         assert_eq!(a.kinds.get("H6"), Some(&Mechanical::Imports));
         assert_eq!(a.kinds.get("H7"), None);
+    }
+
+    fn moved(hs: &[Hunk]) -> Analysis {
+        let inputs: Vec<Input> = hs
+            .iter()
+            .map(|h| Input {
+                file: "A.hs",
+                hunk: h,
+                generated: false,
+                in_imports: false,
+            })
+            .collect();
+        analyse(&inputs)
+    }
+
+    #[test]
+    fn moved_functions_are_mechanical() {
+        let f = ["foo :: Int -> Int", "foo x =", "", "  let y = x + 1", "  in y * 2"];
+        let minus: Vec<String> = f.iter().map(|l| format!("-{l}")).collect();
+        let plus: Vec<String> = f.iter().map(|l| format!("+    {l}")).collect();
+        let lines = |v: &[String], extra: &[&str]| -> Vec<String> {
+            let mut out: Vec<String> = vec![" ctx".into()];
+            out.extend(v.iter().cloned());
+            out.extend(extra.iter().map(|s| s.to_string()));
+            out
+        };
+        let h = |id: &str, ls: Vec<String>| Hunk {
+            lines: ls,
+            ..hunk(id, &[])
+        };
+        let k = moved(&[h("H1", lines(&minus, &[])), h("H2", lines(&plus, &[" ctx"]))]);
+        assert_eq!(k.kinds.get("H1"), Some(&Mechanical::Moved(vec!["H2".into()])));
+        assert_eq!(k.kinds.get("H2"), Some(&Mechanical::Moved(vec!["H1".into()])));
+
+        let k = moved(&[h("H1", lines(&minus, &[])), h("H2", lines(&plus, &["+bar = 2"]))]);
+        assert_eq!(k.kinds.get("H1"), Some(&Mechanical::Moved(vec!["H2".into()])));
+        assert_eq!(k.kinds.get("H2"), None);
+        assert_eq!(k.partly_moved.get("H2"), Some(&vec!["H1".to_string()]));
+
+        let mut swapped = minus.clone();
+        swapped.push(" g = 1".into());
+        swapped.extend(plus.iter().cloned());
+        let k = moved(&[h("H1", swapped)]);
+        assert_eq!(k.kinds.get("H1"), Some(&Mechanical::Moved(Vec::new())));
+
+        let k = moved(&[hunk("H1", &["-}", "-end", " x", "+}", "+end"])]);
+        assert!(!matches!(k.kinds.get("H1"), Some(Mechanical::Moved(_))));
+
+        let k = moved(&[h("H1", lines(&minus, &[])), h("H2", lines(&minus, &[]))]);
+        assert_eq!(k.kinds.get("H1"), None);
+
+        let mut indented = minus.clone();
+        indented.extend(plus.iter().cloned());
+        let k = moved(&[h("H1", indented)]);
+        assert_eq!(k.kinds.get("H1"), Some(&Mechanical::Formatting));
     }
 
     #[test]

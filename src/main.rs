@@ -366,7 +366,17 @@ fn print_text(m: &Manifest) {
             .collect()
     };
     let (gen_, fmt, imp) = (of_kind("generated"), of_kind("formatting"), of_kind("imports"));
-    if !m.patterns.is_empty() || !gen_.is_empty() || !fmt.is_empty() || !imp.is_empty() || !mech.is_empty() {
+    let moved: Vec<String> = m
+        .hunks
+        .iter()
+        .filter_map(|h| match &h.mechanical {
+            Some(mechanical::Mechanical::Moved(o)) if o.is_empty() => Some(h.id.clone()),
+            Some(mechanical::Mechanical::Moved(o)) => Some(format!("{}↔{}", h.id, o.join(","))),
+            _ => None,
+        })
+        .collect();
+    let any = [&gen_, &fmt, &imp].iter().any(|v| !v.is_empty()) || !moved.is_empty();
+    if !m.patterns.is_empty() || any || !mech.is_empty() {
         println!("Mechanical");
         for p in &m.patterns {
             let subs: Vec<String> = p
@@ -404,6 +414,9 @@ fn print_text(m: &Manifest) {
                 println!("  {:<11} {}", name, ids.join(" "));
             }
         }
+        if !moved.is_empty() {
+            println!("  {:<11} {}", "moved", moved.join(" "));
+        }
         if !mech.is_empty() {
             let ids: Vec<&str> = mech.iter().map(|s| s.id.as_str()).collect();
             println!("  symbols     {}", ids.join(" "));
@@ -429,6 +442,7 @@ fn label_kind(k: &mechanical::Mechanical) -> &'static str {
         mechanical::Mechanical::Formatting => "formatting",
         mechanical::Mechanical::Imports => "imports",
         mechanical::Mechanical::Pattern(_) => "pattern",
+        mechanical::Mechanical::Moved(_) => "moved",
     }
 }
 

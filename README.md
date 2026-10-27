@@ -12,7 +12,9 @@ cicerone shows the code at five zoom levels:
 | Skeleton | The control flow, with the mechanical lines folded |
 | Full | All the code, with the removed lines in place |
 
-The tour shows names before their uses. Mechanical changes (formatting, imports, generated files, and repeated substitutions) go into one stage that you can skim. Tests come late.
+The tour shows names before their uses. Mechanical changes (formatting, imports, moved code, generated files, and repeated substitutions) go into one stage that you can skim. Tests come late.
+
+A hunk is moved code when each of its changed lines, up to whitespace, comes back on the other side of the diff: in another hunk, another file, or another place in the same hunk. If only some lines of a hunk come back, the agent gets a "partly moved" hint with the hunks that hold those lines.
 
 Haskell and Elm get syntax highlighting, and their signature and skeleton levels come from the syntax tree. For other languages, the agent zooms a file with labeled holes: the skeleton level folds each hole, and `+` opens it.
 

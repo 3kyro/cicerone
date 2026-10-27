@@ -134,9 +134,7 @@ fn material(ws: &Workspace) -> String {
                 let _ = writeln!(s, "\n### {}", f.diff.path);
                 header = true;
             }
-            let hint = mech
-                .map(|m| format!("  likely mechanical: {}", crate::classes::hint(ws, m)))
-                .unwrap_or_default();
+            let hint = crate::classes::hints(ws, &h.id);
             let _ = writeln!(
                 s,
                 "@@ {} -{},{} +{},{}{hint}",

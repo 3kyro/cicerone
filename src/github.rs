@@ -340,6 +340,7 @@ mod tests {
                     removed: 0,
                     place: Place::Symbols,
                     mechanical: None,
+                    partly_moved: Vec::new(),
                     symbols: Vec::new(),
                 }],
                 patterns: Vec::new(),

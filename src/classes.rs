@@ -86,7 +86,7 @@ pub const PROMPT: &str = r#"Now classify every hunk of the diff, from your revie
 - "wiring": code that connects the change to the rest: exports, routes, configuration, callers that only pass a value on.
 - "docs": documentation, changelogs, release notes, API descriptions, comments that explain behavior.
 - "tests": tests and test helpers.
-- "mechanical": changes with no effect on behavior: formatting, import lists, renames done the same way everywhere, generated files. A hint that says "likely mechanical" is not proof: check it, and do not use "mechanical" for a hunk that changes behavior in any way.
+- "mechanical": changes with no effect on behavior: formatting, import lists, renames done the same way everywhere, code moved with no change, generated files. A hint that says "likely mechanical" is not proof: check it, and do not use "mechanical" for a hunk that changes behavior in any way.
 
 Answer with JSON Lines only. First one line that lists every distinct change in the diff, one sentence each, the main change first. Include the smaller changes too: a changed default, a docs page, a version bump, a behavior change in another part.
 {"changes":["...","..."]}
@@ -242,6 +242,34 @@ pub fn hint(ws: &Workspace, m: &Mechanical) -> String {
                 .unwrap_or_default();
             format!("same substitution as the other hunks of pattern {id}: {}", subs.join(", "))
         }
+        Mechanical::Moved(others) if others.is_empty() => "code moved inside this hunk, with no other change".into(),
+        Mechanical::Moved(others) => format!("moved code: the same lines, up to whitespace, as {}", places(ws, others)),
+    }
+}
+
+fn places(ws: &Workspace, hunks: &[String]) -> String {
+    let ps: Vec<String> = hunks
+        .iter()
+        .map(|o| match ws.hunk(o) {
+            Some(h) => format!("{o} in `{}`", h.file),
+            None => o.clone(),
+        })
+        .collect();
+    ps.join(", ")
+}
+
+/// The detector hints for a hunk, to append to its `@@` line.
+pub fn hints(ws: &Workspace, id: &str) -> String {
+    let Some(h) = ws.hunk(id) else {
+        return String::new();
+    };
+    match &h.mechanical {
+        Some(m) => format!("  likely mechanical: {}", hint(ws, m)),
+        None if !h.partly_moved.is_empty() => format!(
+            "  partly moved: some lines are the same as {}, the other lines are new",
+            places(ws, &h.partly_moved)
+        ),
+        None => String::new(),
     }
 }
 
@@ -261,6 +289,7 @@ pub(crate) mod tests {
             removed: 1,
             place: Place::Other,
             mechanical,
+            partly_moved: Vec::new(),
             symbols: Vec::new(),
         }
     }
@@ -290,6 +319,21 @@ pub(crate) mod tests {
             }],
             snapshot: None,
         }
+    }
+
+    #[test]
+    fn hints_name_where_code_moved() {
+        let mut ws = ws();
+        ws.manifest.hunks[0].mechanical = Some(Mechanical::Moved(vec!["H3".into()]));
+        ws.manifest.hunks[2].partly_moved = vec!["H1".into()];
+        assert_eq!(
+            hints(&ws, "H1"),
+            "  likely mechanical: moved code: the same lines, up to whitespace, as H3 in `A.hs`"
+        );
+        assert_eq!(
+            hints(&ws, "H3"),
+            "  partly moved: some lines are the same as H1 in `A.hs`, the other lines are new"
+        );
     }
 
     #[test]

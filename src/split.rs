@@ -75,7 +75,8 @@ fn part_prompt(ws: &Workspace, files: &[String], n: usize, total: usize) -> Stri
     for f in ws.files.iter().filter(|f| files.contains(&f.diff.path)) {
         let _ = writeln!(s, "\n### {}", f.diff.path);
         for h in &f.diff.hunks {
-            let _ = writeln!(s, "@@ {} -{},{} +{},{}", h.id, h.old_start, h.old_len, h.new_start, h.new_len);
+            let hint = crate::classes::hints(ws, &h.id);
+            let _ = writeln!(s, "@@ {} -{},{} +{},{}{hint}", h.id, h.old_start, h.old_len, h.new_start, h.new_len);
             let text = hunk_text(h);
             if text.len() > PART {
                 let _ = writeln!(s, "(this hunk is too long to show: read the file under FILES)");
@@ -106,11 +107,7 @@ pub fn merge_prompt(ws: &Workspace, parts: usize, findings: &[String], failed: &
         for f in &ws.files {
             let _ = writeln!(d, "\n### {}", f.diff.path);
             for h in &f.diff.hunks {
-                let mech = ws
-                    .hunk(&h.id)
-                    .and_then(|x| x.mechanical.as_ref())
-                    .map(|m| format!("  likely mechanical: {}", crate::classes::hint(ws, m)))
-                    .unwrap_or_default();
+                let mech = crate::classes::hints(ws, &h.id);
                 let _ = writeln!(d, "@@ {} -{},{} +{},{}{mech}", h.id, h.old_start, h.old_len, h.new_start, h.new_len);
                 let changed: Vec<&String> = h.lines.iter().filter(|l| !l.starts_with(' ')).collect();
                 for l in changed.iter().take(lines) {

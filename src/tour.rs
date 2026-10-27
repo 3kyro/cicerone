@@ -184,16 +184,14 @@ pub fn auto(ws: &Workspace) -> Tour {
             }
         })
         .collect();
-    if m.hunks.iter().any(|h| {
-        matches!(
-            h.mechanical,
-            Some(crate::mechanical::Mechanical::Formatting)
-                | Some(crate::mechanical::Mechanical::Imports)
-                | Some(crate::mechanical::Mechanical::Generated)
-        )
-    }) {
+    let kinds: Vec<&str> = crate::view::MECHANICAL_KINDS
+        .iter()
+        .filter(|(_, is)| m.hunks.iter().any(|h| h.mechanical.as_ref().is_some_and(is)))
+        .map(|(title, _)| *title)
+        .collect();
+    if !kinds.is_empty() {
         mech.push(Step {
-            title: "Formatting, imports, generated".into(),
+            title: kinds.join(", "),
             text: String::new(),
             blocks: vec![Block::Mechanical],
         });

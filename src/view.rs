@@ -585,15 +585,20 @@ pub fn pattern(ws: &Workspace, id: &str, w: usize) -> Lines {
     out
 }
 
+type IsKind = fn(&Mechanical) -> bool;
+
+pub const MECHANICAL_KINDS: [(&str, IsKind); 4] = [
+    ("Formatting", |k| *k == Mechanical::Formatting),
+    ("Imports", |k| *k == Mechanical::Imports),
+    ("Moved code", |k| matches!(k, Mechanical::Moved(_))),
+    ("Generated", |k| *k == Mechanical::Generated),
+];
+
 pub fn mechanical(ws: &Workspace, w: usize) -> Lines {
     let m = &ws.manifest;
     let mut out = Vec::new();
-    for (title, want) in [
-        ("Formatting", Mechanical::Formatting),
-        ("Imports", Mechanical::Imports),
-        ("Generated", Mechanical::Generated),
-    ] {
-        let hs: Vec<_> = m.hunks.iter().filter(|h| h.mechanical.as_ref() == Some(&want)).collect();
+    for (title, is) in MECHANICAL_KINDS {
+        let hs: Vec<_> = m.hunks.iter().filter(|h| h.mechanical.as_ref().is_some_and(is)).collect();
         if hs.is_empty() {
             continue;
         }
@@ -601,11 +606,15 @@ pub fn mechanical(ws: &Workspace, w: usize) -> Lines {
             format!("{title} · {} hunks", hs.len()),
             Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
         )));
-        let mut files: Vec<(&str, Vec<&str>)> = Vec::new();
+        let mut files: Vec<(&str, Vec<String>)> = Vec::new();
         for h in hs {
+            let id = match &h.mechanical {
+                Some(Mechanical::Moved(o)) if !o.is_empty() => format!("{}↔{}", h.id, o.join(",")),
+                _ => h.id.clone(),
+            };
             match files.iter_mut().find(|(f, _)| *f == h.file) {
-                Some((_, v)) => v.push(&h.id),
-                None => files.push((&h.file, vec![&h.id])),
+                Some((_, v)) => v.push(id),
+                None => files.push((&h.file, vec![id])),
             }
         }
         for (f, ids) in files {

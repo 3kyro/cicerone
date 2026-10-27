@@ -53,6 +53,8 @@ pub struct HunkEntry {
     pub removed: usize,
     pub place: Place,
     pub mechanical: Option<Mechanical>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partly_moved: Vec<String>,
     pub symbols: Vec<String>,
 }
 
@@ -239,6 +241,7 @@ fn classify_mechanical(m: &mut Manifest, repo: &Repo, range: &Range, diff: &[&Fi
     }
     for h in &mut m.hunks {
         h.mechanical = a.kinds.remove(&h.id);
+        h.partly_moved = a.partly_moved.remove(&h.id).unwrap_or_default();
     }
     let mechanical_hunks: BTreeSet<&str> = m
         .hunks
@@ -394,6 +397,7 @@ fn add_file(
             removed: h.removed(),
             place,
             mechanical: None,
+            partly_moved: Vec::new(),
             symbols: syms,
         });
     }
