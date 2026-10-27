@@ -243,7 +243,7 @@ pub fn hint(ws: &Workspace, m: &Mechanical) -> String {
             format!("same substitution as the other hunks of pattern {id}: {}", subs.join(", "))
         }
         Mechanical::Moved(others) if others.is_empty() => "code moved inside this hunk, with no other change".into(),
-        Mechanical::Moved(others) => format!("moved code: the same lines, up to whitespace, as {}", places(ws, others)),
+        Mechanical::Moved(others) => format!("moved code: the same top-level lines as {}", places(ws, others)),
     }
 }
 
@@ -328,7 +328,7 @@ pub(crate) mod tests {
         ws.manifest.hunks[2].partly_moved = vec!["H1".into()];
         assert_eq!(
             hints(&ws, "H1"),
-            "  likely mechanical: moved code: the same lines, up to whitespace, as H3 in `A.hs`"
+            "  likely mechanical: moved code: the same top-level lines as H3 in `A.hs`"
         );
         assert_eq!(
             hints(&ws, "H3"),

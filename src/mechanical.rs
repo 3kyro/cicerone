@@ -142,15 +142,18 @@ struct Run {
     lines: Vec<String>,
 }
 
-/// Hunks whose every changed line, up to whitespace, comes back on the other
-/// side of the diff, and hunks where only some lines do, each with the other
-/// hunks that hold those lines. A run must match whole and be long enough
-/// that short lines like `}` or `else` do not match by chance, and match in
-/// one place only. A partly moved hunk needs a longer run, because a short
-/// run that matches is only noise next to the other changes. A run never
-/// matches the run next to it: that is the same code with new indentation.
 type Moves = BTreeMap<usize, BTreeSet<usize>>;
 
+/// Hunks whose every changed line comes back on the other side of the diff,
+/// and hunks where only some lines do, each with the other hunks that hold
+/// those lines. Lines compare with their indentation, which carries meaning
+/// in Haskell, Elm, Python, and YAML. Only a run with a line at column 0
+/// makes a hunk moved code: a top-level declaration can move with no effect,
+/// but statements that move inside a body run in a new order. A run must be
+/// long enough that lines like `}` do not match by chance, and must match in
+/// one place only. A run never matches the run next to it: that is the same
+/// code with new indentation. A partly moved hunk needs a longer run,
+/// because a short run that matches is only noise next to the other changes.
 fn moves(inputs: &[Input], hunks: &[usize]) -> (Moves, Moves) {
     let mut runs: Vec<Run> = Vec::new();
     for &i in hunks {
@@ -167,7 +170,7 @@ fn moves(inputs: &[Input], hunks: &[usize]) -> (Moves, Moves) {
             if cur.as_ref().is_some_and(|r| r.removed != removed) {
                 runs.extend(cur.take());
             }
-            let line = crate::syntax::normalize(&l[1..]);
+            let line = l[1..].trim_end().to_string();
             let r = cur.get_or_insert(Run {
                 hunk: i,
                 removed,
@@ -176,7 +179,7 @@ fn moves(inputs: &[Input], hunks: &[usize]) -> (Moves, Moves) {
                 lines: Vec::new(),
             });
             r.end = n + 1;
-            if !line.is_empty() {
+            if !line.trim().is_empty() {
                 r.lines.push(line);
             }
         }
@@ -211,26 +214,30 @@ fn moves(inputs: &[Input], hunks: &[usize]) -> (Moves, Moves) {
             .flatten()
             .filter(|&&(o, p)| !next_to(o) && runs[o].lines.get(p..p + n).is_some_and(|w| w == r.lines.as_slice()))
             .collect();
-        if let [&(o, p)] = hits[..] {
+        let Some(&&(o, p)) = hits.first().filter(|_| hits.len() == 1) else {
+            continue;
+        };
+        if r.lines.iter().any(|l| !l.starts_with(char::is_whitespace)) {
             covered[k].fill(true);
             covered[o][p..p + n].fill(true);
             pairs.entry(r.hunk).or_default().insert(runs[o].hunk);
             pairs.entry(runs[o].hunk).or_default().insert(r.hunk);
-            if wordy >= MIN_PARTLY_MOVED_LINES && words >= MIN_PARTLY_MOVED_WORDS {
-                long.entry(r.hunk).or_default().insert(runs[o].hunk);
-                long.entry(runs[o].hunk).or_default().insert(r.hunk);
-            }
+        }
+        if wordy >= MIN_PARTLY_MOVED_LINES && words >= MIN_PARTLY_MOVED_WORDS {
+            long.entry(r.hunk).or_default().insert(runs[o].hunk);
+            long.entry(runs[o].hunk).or_default().insert(r.hunk);
         }
     }
     let (mut full, mut partly) = (BTreeMap::new(), BTreeMap::new());
-    for (i, mut others) in pairs {
+    let touched: BTreeSet<usize> = pairs.keys().chain(long.keys()).copied().collect();
+    for i in touched {
         let all = runs
             .iter()
             .zip(&covered)
             .filter(|(r, _)| r.hunk == i)
             .all(|(_, c)| c.iter().all(|&x| x));
-        others.remove(&i);
-        if all {
+        if let Some(mut others) = pairs.remove(&i).filter(|_| all) {
+            others.remove(&i);
             full.insert(i, others);
         } else if let Some(mut others) = long.remove(&i) {
             others.remove(&i);
@@ -611,7 +618,8 @@ mod tests {
     fn moved_functions_are_mechanical() {
         let f = ["foo :: Int -> Int", "foo x =", "", "  let y = x + 1", "  in y * 2"];
         let minus: Vec<String> = f.iter().map(|l| format!("-{l}")).collect();
-        let plus: Vec<String> = f.iter().map(|l| format!("+    {l}")).collect();
+        let plus: Vec<String> = f.iter().map(|l| format!("+{l}")).collect();
+        let shifted: Vec<String> = f.iter().map(|l| format!("+    {l}")).collect();
         let lines = |v: &[String], extra: &[&str]| -> Vec<String> {
             let mut out: Vec<String> = vec![" ctx".into()];
             out.extend(v.iter().cloned());
@@ -643,8 +651,23 @@ mod tests {
         let k = moved(&[h("H1", lines(&minus, &[])), h("H2", lines(&minus, &[]))]);
         assert_eq!(k.kinds.get("H1"), None);
 
+        let k = moved(&[h("H1", lines(&minus, &[])), h("H2", lines(&shifted, &[]))]);
+        assert_eq!(k.kinds.get("H1"), None);
+
+        let body: Vec<String> = f.iter().map(|l| format!("-  {l}")).collect();
+        let body_plus: Vec<String> = f.iter().map(|l| format!("+  {l}")).collect();
+        let k = moved(&[h("H1", lines(&body, &[])), h("H2", lines(&body_plus, &[]))]);
+        assert_eq!(k.kinds.get("H1"), None);
+        assert_eq!(k.partly_moved.get("H1"), Some(&vec!["H2".to_string()]));
+
+        let k = moved(&[
+            hunk("H1", &["-f = \"a  b\"", "-g = f ++ f", " x"]),
+            hunk("H2", &[" y", "+f = \"a b\"", "+g = f ++ f"]),
+        ]);
+        assert_eq!(k.kinds.get("H1"), None);
+
         let mut indented = minus.clone();
-        indented.extend(plus.iter().cloned());
+        indented.extend(shifted.iter().cloned());
         let k = moved(&[h("H1", indented)]);
         assert_eq!(k.kinds.get("H1"), Some(&Mechanical::Formatting));
     }
