@@ -36,7 +36,8 @@ pub struct Options<'a> {
 
 impl Agent {
     pub fn start(o: Options, tx: Sender<Event>) -> Result<Agent> {
-        let mut cmd = Command::new("claude");
+        let program = claude_command();
+        let mut cmd = Command::new(&program);
         cmd.current_dir(o.cwd)
             .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json"])
             .args(["--include-partial-messages", "--verbose"])
@@ -60,7 +61,7 @@ impl Agent {
             .stdout(Stdio::piped())
             .stderr(stderr)
             .spawn()
-            .context("starting claude")?;
+            .with_context(|| format!("starting {}", program.to_string_lossy()))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let tools = o
@@ -77,6 +78,12 @@ impl Agent {
         self.stdin.flush()?;
         Ok(())
     }
+}
+
+fn claude_command() -> std::ffi::OsString {
+    std::env::var_os("CICERONE_CLAUDE")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "claude".into())
 }
 
 impl Drop for Agent {

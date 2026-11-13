@@ -22,6 +22,8 @@ Haskell and Elm get syntax highlighting, and their signature and skeleton levels
 
 You need Rust (edition 2024), `git`, and the `claude` CLI on `PATH`. For `S` (post to GitHub), you also need `gh`.
 
+If you start Claude Code with your own script, set `CICERONE_CLAUDE` to the path of that script. cicerone then runs it in place of `claude`. The script must pass all of its arguments, stdin, and stdout on to `claude`. The arguments hold the limits of the agent (see [The agent](#the-agent)).
+
 ```sh
 cargo install --git https://github.com/3kyro/cicerone
 ```

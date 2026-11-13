@@ -23,7 +23,8 @@ The tab runs `cicerone review <range>`: a staged tour of the change (map, vocabu
    root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
    win=$(kitty @ launch --type=tab --cwd "$root" --tab-title "cicerone: $(basename "$root")" \
      --env CLAUDE_CODE_MESSAGING_SOCKET="$CLAUDE_CODE_MESSAGING_SOCKET" \
-     --env CLAUDE_CODE_MESSAGING_TOKEN="$CLAUDE_CODE_MESSAGING_TOKEN")
+     --env CLAUDE_CODE_MESSAGING_TOKEN="$CLAUDE_CODE_MESSAGING_TOKEN" \
+     --env CICERONE_CLAUDE="$CICERONE_CLAUDE")
    kitty @ send-text --match "id:$win" -- $'cicerone review <range>\n'
    ```
    For a PR, add `--pr <number>` (so `S` in cicerone can post the review to it): `cicerone review --pr <number> <range>`, and title the tab `cicerone: PR #<number>`. Keep `--cwd "$root"`: the range only resolves inside the PR's own clone.
