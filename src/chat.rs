@@ -1,6 +1,6 @@
 use crate::theme::*;
 use crate::view;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -169,60 +169,69 @@ impl Chat {
         out
     }
 
-    /// The input wrapped at `w` columns, the cursor after the last
-    /// character.
     pub fn input_lines(&self, w: usize) -> Vec<Line<'static>> {
-        let prompt = Style::default().fg(MAUVE).add_modifier(Modifier::BOLD);
-        let cursor = Span::styled("▍", Style::default().fg(MAUVE));
-        if self.input.is_empty() {
-            let hint = if self.about.is_some() { " ask about this lens" } else { " ask about the change" };
-            return vec![Line::from(vec![Span::styled("› ", prompt), cursor, Span::styled(hint, dim())])];
-        }
-        let room = w.saturating_sub(3).max(1);
-        let mut rows: Vec<(String, usize)> = vec![(String::new(), 0)];
-        for piece in self.input.split_inclusive(' ') {
-            let pw = piece.width();
-            let used = rows.last().map_or(0, |r| r.1);
-            if used + pw <= room {
+        let hint = if self.about.is_some() { " ask about this lens" } else { " ask about the change" };
+        input_lines(&self.input, w, hint, MAUVE)
+    }
+}
+
+pub fn delete_word(input: &mut String) {
+    let t = input.trim_end().len();
+    let cut = input[..t].rfind(' ').map_or(0, |i| i + 1);
+    input.truncate(cut);
+}
+
+/// `input` wrapped at `w` columns, the cursor after the last character.
+pub fn input_lines(input: &str, w: usize, hint: &str, color: Color) -> Vec<Line<'static>> {
+    let prompt = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let cursor = Span::styled("▍", Style::default().fg(color));
+    if input.is_empty() {
+        return vec![Line::from(vec![Span::styled("› ", prompt), cursor, Span::styled(hint.to_string(), dim())])];
+    }
+    let room = w.saturating_sub(3).max(1);
+    let mut rows: Vec<(String, usize)> = vec![(String::new(), 0)];
+    for piece in input.split_inclusive(' ') {
+        let pw = piece.width();
+        let used = rows.last().map_or(0, |r| r.1);
+        if used + pw <= room {
+            let row = rows.last_mut().unwrap();
+            row.0.push_str(piece);
+            row.1 += pw;
+        } else if piece.trim().is_empty() {
+            rows.push((String::new(), 0));
+        } else if used > 0 && pw <= room {
+            rows.push((piece.to_string(), pw));
+        } else {
+            for c in piece.chars() {
+                let cw = c.width().unwrap_or(0);
                 let row = rows.last_mut().unwrap();
-                row.0.push_str(piece);
-                row.1 += pw;
-            } else if piece.trim().is_empty() {
-                rows.push((String::new(), 0));
-            } else if used > 0 && pw <= room {
-                rows.push((piece.to_string(), pw));
-            } else {
-                for c in piece.chars() {
-                    let cw = c.width().unwrap_or(0);
-                    let row = rows.last_mut().unwrap();
-                    if row.1 + cw > room && row.1 > 0 {
-                        rows.push((c.to_string(), cw));
-                    } else {
-                        row.0.push(c);
-                        row.1 += cw;
-                    }
+                if row.1 + cw > room && row.1 > 0 {
+                    rows.push((c.to_string(), cw));
+                } else {
+                    row.0.push(c);
+                    row.1 += cw;
                 }
             }
         }
-        if rows.len() > 1 && rows.last().is_some_and(|r| r.0.is_empty()) {
-            rows.pop();
-        }
-        let rows: Vec<String> = rows.into_iter().map(|r| r.0).collect();
-        let last = rows.len() - 1;
-        rows.into_iter()
-            .enumerate()
-            .map(|(i, row)| {
-                let mut spans = vec![
-                    Span::styled(if i == 0 { "› " } else { "  " }, prompt),
-                    Span::styled(row, text()),
-                ];
-                if i == last {
-                    spans.push(cursor.clone());
-                }
-                Line::from(spans)
-            })
-            .collect()
     }
+    if rows.len() > 1 && rows.last().is_some_and(|r| r.0.is_empty()) {
+        rows.pop();
+    }
+    let rows: Vec<String> = rows.into_iter().map(|r| r.0).collect();
+    let last = rows.len() - 1;
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut spans = vec![
+                Span::styled(if i == 0 { "› " } else { "  " }, prompt),
+                Span::styled(row, text()),
+            ];
+            if i == last {
+                spans.push(cursor.clone());
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Puts `text` on the system clipboard through the terminal (OSC 52).

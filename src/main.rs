@@ -8,6 +8,7 @@ mod github;
 mod highlight;
 mod lens;
 mod manifest;
+mod message;
 mod mechanical;
 mod plan;
 mod report;

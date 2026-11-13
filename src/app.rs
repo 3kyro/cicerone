@@ -4,7 +4,7 @@ use crate::lens::{Lenses, Resolution};
 use crate::classes::Classes;
 use crate::plan::{self, Phase};
 use crate::review;
-use crate::{github, report, session, split};
+use crate::{github, message, report, session, split};
 use crate::manifest::Workspace;
 use crate::theme::*;
 use crate::tour::{Block, Tour};
@@ -71,6 +71,8 @@ pub struct App<'a> {
     compose: bool,
     scratch: Option<tempfile::TempDir>,
     chat: Chat,
+    message: Option<message::Compose>,
+    draft: String,
     config: Option<AgentConfig>,
     needs_primer: bool,
     resuming: bool,
@@ -131,6 +133,8 @@ impl<'a> App<'a> {
             compose: false,
             scratch: None,
             chat: Chat::default(),
+            message: None,
+            draft: String::new(),
             config: None,
             needs_primer: false,
             resuming: false,
@@ -1114,11 +1118,7 @@ impl<'a> App<'a> {
             KeyCode::Esc => self.chat.open = false,
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('u') if ctrl => self.chat.input.clear(),
-            KeyCode::Char('w') if ctrl => {
-                let t = self.chat.input.trim_end().len();
-                let cut = self.chat.input[..t].rfind(' ').map_or(0, |i| i + 1);
-                self.chat.input.truncate(cut);
-            }
+            KeyCode::Char('w') if ctrl => chat::delete_word(&mut self.chat.input),
             KeyCode::Enter => self.ask(),
             KeyCode::Backspace => {
                 self.chat.input.pop();
@@ -1136,40 +1136,114 @@ impl<'a> App<'a> {
 
     fn open_chat(&mut self, about_lens: bool) {
         self.chat.open = true;
-        self.chat.about = None;
+        self.chat.about = if about_lens { self.anchor().map(|a| (a.label, a.detail)) } else { None };
+    }
+
+    fn anchor(&mut self) -> Option<message::Anchor> {
         let finding = self.step_blocks().iter().find_map(|b| match b {
             Block::Finding(id) => self.findings.iter().find(|f| &f.id == id).cloned(),
             _ => None,
         });
-        if about_lens && let Some(f) = finding {
-            self.chat.about = Some((
-                format!("{} · {}", f.id, f.title),
-                format!("review finding {} ({} at {}:{}-{})", f.id, f.title, f.file, f.lines.0, f.lines.1),
-            ));
+        if let Some(f) = finding {
+            return Some(message::Anchor {
+                label: format!("{} · {}", f.id, f.title),
+                detail: format!("review finding {} ({} at {}:{}-{})", f.id, f.title, f.file, f.lines.0, f.lines.1),
+                quote: Some(f.body),
+            });
+        }
+        let spec = self.focused_spec()?;
+        let (res, diff) = self
+            .overrides
+            .get(&(self.pos, self.focus))
+            .copied()
+            .unwrap_or((spec.resolution, None));
+        let v = self.lenses.view(self.ws, &spec, res, diff);
+        let target = spec
+            .symbol
+            .or(spec.hunk)
+            .filter(|t| *t != v.title)
+            .map(|t| format!(" ({t})"))
+            .unwrap_or_default();
+        Some(message::Anchor {
+            label: format!("{} · {}", v.title, v.place),
+            detail: format!("{}{target} at {}, shown at resolution {}", v.title, v.place, res.label()),
+            quote: None,
+        })
+    }
+
+    fn open_message(&mut self) {
+        let Some(session) = session::opener() else {
+            self.notice = Some("No Claude session opened cicerone, so M has nowhere to send. Use /cicerone.".into());
+            return;
+        };
+        let step = self.steps.get(self.pos).map(|&(si, i)| {
+            let st = &self.tour().stages[si];
+            (st.title.clone(), st.steps[i].title.clone())
+        });
+        let root = match &self.config {
+            Some(c) if self.root.as_os_str().is_empty() => c.root.clone(),
+            _ => self.root.clone(),
+        };
+        let place = message::Place {
+            root,
+            base: self.ws.manifest.base.clone(),
+            head: self.ws.manifest.head.clone(),
+            pr: self.pr,
+            step,
+            anchor: self.anchor(),
+        };
+        self.message = Some(message::Compose {
+            session,
+            place,
+            input: std::mem::take(&mut self.draft),
+            error: None,
+        });
+    }
+
+    fn message_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(m) = &mut self.message else { return };
+        m.error = None;
+        match k.code {
+            KeyCode::Esc => self.draft = self.message.take().map(|m| m.input).unwrap_or_default(),
+            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('u') if ctrl => m.input.clear(),
+            KeyCode::Char('w') if ctrl => chat::delete_word(&mut m.input),
+            KeyCode::Enter => self.send_message(),
+            KeyCode::Backspace => {
+                m.input.pop();
+            }
+            KeyCode::Char(c) if !ctrl => m.input.push(c),
+            _ => {}
+        }
+    }
+
+    fn send_message(&mut self) {
+        let Some(m) = &mut self.message else { return };
+        if m.input.trim().is_empty() {
             return;
         }
-        if about_lens && let Some(spec) = self.focused_spec() {
-            let (res, diff) = self
-                .overrides
-                .get(&(self.pos, self.focus))
-                .copied()
-                .unwrap_or((spec.resolution, None));
-            let v = self.lenses.view(self.ws, &spec, res, diff);
-            let target = spec
-                .symbol
-                .clone()
-                .or(spec.hunk.clone())
-                .unwrap_or_default();
-            self.chat.about = Some((
-                format!("{} · {}", v.title, v.place),
-                format!("{} ({target}) at {}, shown at resolution {}", v.title, v.place, res.label()),
-            ));
+        let text = message::text(&m.place, &m.input);
+        if !self.terminal {
+            m.error = Some(format!("would send {} characters", text.chars().count()));
+            return;
+        }
+        match session::send(&m.session, &text) {
+            Ok(()) => {
+                self.notice = Some(format!("Sent to Claude session '{}'.", m.session.name));
+                self.message = None;
+            }
+            Err(e) => m.error = Some(format!("{e:#}")),
         }
     }
 
     fn key(&mut self, k: KeyEvent) {
         if self.help {
             self.help = false;
+            return;
+        }
+        if self.message.is_some() {
+            self.message_key(k);
             return;
         }
         if self.chat.open {
@@ -1218,6 +1292,7 @@ impl<'a> App<'a> {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('m') => self.toggle_mouse(),
             KeyCode::Char('E') => self.start_report(),
+            KeyCode::Char('M') => self.open_message(),
             KeyCode::Char('S') => self.compose = true,
             KeyCode::Char('A') => self.switch_tour(if self.current == AUTO { AGENT } else { AUTO }),
             _ => {}
@@ -1235,7 +1310,14 @@ impl<'a> App<'a> {
         if rail_w > 0 {
             self.draw_rail(f, rail);
         }
-        if self.chat.open {
+        if self.message.is_some() {
+            let w = main.width.saturating_sub(4) as usize;
+            let input_h = self.message.as_ref().map_or(1, |m| message_input(m, w).len().clamp(1, MAX_INPUT_LINES));
+            let panel_h = (input_h + 3) as u16;
+            let [content, panel] = Layout::vertical([Constraint::Min(4), Constraint::Length(panel_h)]).areas(main);
+            self.draw_main(f, content);
+            self.draw_message(f, panel);
+        } else if self.chat.open {
             let chat_h = (main.height * 45 / 100).max(8);
             let [content, chat] = Layout::vertical([Constraint::Min(4), Constraint::Length(chat_h)]).areas(main);
             self.draw_main(f, content);
@@ -1573,7 +1655,54 @@ impl<'a> App<'a> {
         f.render_widget(Paragraph::new(typed[skip..].to_vec()), input);
     }
 
+    fn draw_message(&mut self, f: &mut Canvas, area: Rect) {
+        let Some(m) = &self.message else { return };
+        let mut title = vec![Span::styled(
+            format!(" → Claude session '{}' ", m.session.name),
+            Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+        )];
+        if let Some(e) = &m.error {
+            title.push(Span::styled(format!("· {e} "), Style::default().fg(RED)));
+        }
+        let block = Frame::default()
+            .borders(Borders::TOP)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BLUE))
+            .title(Line::from(title))
+            .padding(Padding::new(2, 2, 0, 1));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let typed = message_input(m, inner.width as usize);
+        let input_h = typed.len().clamp(1, MAX_INPUT_LINES);
+        let [about, input] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(input_h as u16)]).areas(inner);
+        let about_line = match (&m.place.anchor, &m.place.step) {
+            (Some(a), _) => Line::from(vec![
+                Span::styled("about ", dim()),
+                Span::styled(a.label.clone(), Style::default().fg(LAVENDER)),
+            ]),
+            (None, Some((_, step))) => Line::from(vec![
+                Span::styled("at step ", dim()),
+                Span::styled(step.clone(), Style::default().fg(LAVENDER)),
+            ]),
+            (None, None) => Line::from(Span::styled("about the change", dim())),
+        };
+        f.render_widget(Paragraph::new(about_line), about);
+        let skip = typed.len().saturating_sub(input_h);
+        f.render_widget(Paragraph::new(typed[skip..].to_vec()), input);
+    }
+
     fn draw_status(&self, f: &mut Canvas, area: Rect) {
+        if self.message.is_some() {
+            let keys = [("enter", "send"), ("esc", "close, keep the draft"), ("ctrl-u", "clear"), ("ctrl-w", "word")];
+            let mut spans = vec![Span::raw(" ")];
+            for (k, what) in keys {
+                spans.push(Span::styled(k, Style::default().fg(BLUE).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(format!(" {what}   "), dim()));
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(MANTLE)), area);
+            return;
+        }
         if self.chat.open {
             let keys = [
                 ("enter", "send"),
@@ -1603,6 +1732,7 @@ impl<'a> App<'a> {
             ("a", "ask"),
             ("A", "tour"),
             ("E", "report"),
+            ("M", "message"),
             ("S", "post"),
             ("m", if self.mouse { "mouse" } else { "mouse off" }),
             ("?", "help"),
@@ -1615,6 +1745,10 @@ impl<'a> App<'a> {
         }
         f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(MANTLE)), area);
     }
+}
+
+fn message_input(m: &message::Compose, w: usize) -> Vec<Line<'static>> {
+    chat::input_lines(&m.input, w, " message the Claude session that opened cicerone", BLUE)
 }
 
 fn draw_help(f: &mut Canvas, area: Rect) {
@@ -1636,9 +1770,10 @@ fn draw_help(f: &mut Canvas, area: Rect) {
         ("ctrl-y", "in the chat: copy the last answer (terminal needs OSC 52)"),
         ("m", "mouse capture off (select text) / on (wheel scroll)"),
         ("E", "the agent writes a review report; your Claude session publishes it"),
+        ("M", "message your Claude session about the focused lens"),
         ("S", "post the review on the PR: edit it first, as Claude or as you"),
         ("a", "ask about the focused lens"),
-        ("esc", "close the chat or this help"),
+        ("esc", "close the chat, the message box, or this help"),
         ("q", "quit"),
     ];
     let lines: Vec<Line> = rows

@@ -100,6 +100,7 @@ If the diff is larger than 400 KB, cicerone splits it by file into parts. Up to 
 | `c` | Open the chat |
 | `a` | Ask about the focused lens |
 | `E` | Write a review report (see below) |
+| `M` | Send a message to the Claude session that opened cicerone (see below) |
 | `S` | Post the review on the PR (see below) |
 | `m` | Turn mouse capture off to select text, or on to scroll with the wheel |
 | `?` | Help |
@@ -124,6 +125,26 @@ If you tell the agent that a behavior change is intended, the finding becomes `C
 ### Report (`E`)
 
 The agent writes a Markdown report of the review, for another agent to act on. The report names every distinct change, and cicerone adds the coverage note (see below). cicerone saves it as `report.md` in the cache. If a Claude Code session opened cicerone (see the skill below), cicerone sends that session a request to publish the report as a claude.ai Artifact page.
+
+### Message the Claude session (`M`)
+
+If a Claude Code session opened cicerone (see the skill below), `M` opens a message box at the bottom of the screen. Type one message and press `enter`. cicerone sends it to that session at once. It is not a report: the agent does not take part.
+
+The message tells the session that you typed it in cicerone, and where you were:
+
+- The repository, the range, and the PR, if cicerone knows it.
+- The stage and the step of the tour.
+- The focused lens, with its file and lines. If the step shows a finding, the finding and its text go in its place.
+
+The box shows the lens or the finding that the message is about. `esc` closes the box and keeps the draft, and the next `M` opens it again. If the send fails, the box stays open with the error.
+
+In the box:
+
+| Key | Action |
+|---|---|
+| `enter` | Send |
+| `esc` | Close, and keep the draft |
+| `ctrl-u` / `ctrl-w` | Clear the input / delete a word |
 
 ### Post to GitHub (`S`)
 
@@ -188,7 +209,7 @@ Then, in Claude Code:
 /cicerone main...feature  # a range
 ```
 
-The skill needs kitty with remote control on (`allow_remote_control yes`). For `E`, it also needs Claude Code cross-session messaging (`/status` shows a `Peer address` row). Without kitty, the skill gives you the command to run in another terminal.
+The skill needs kitty with remote control on (`allow_remote_control yes`). For `E` and `M`, it also needs Claude Code cross-session messaging (`/status` shows a `Peer address` row). Without kitty, the skill gives you the command to run in another terminal.
 
 ## License
 
