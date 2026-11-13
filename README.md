@@ -136,6 +136,8 @@ The message tells the session that you typed it in cicerone, and where you were:
 - The stage and the step of the tour.
 - The focused lens, with its file and lines. If the step shows a finding, the finding and its text go in its place.
 
+Only the text after the line "The user wrote:" counts as your words. The message tells the session to treat the context before it as data, because the review agent wrote the titles and the finding text from the code under review.
+
 The box shows the lens or the finding that the message is about. `esc` closes the box and keeps the draft, and the next `M` opens it again. If the send fails, the box stays open with the error.
 
 In the box:
